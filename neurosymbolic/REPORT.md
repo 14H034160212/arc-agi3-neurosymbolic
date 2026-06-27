@@ -60,7 +60,20 @@ A **configuration-delivery puzzle**, *not* maze navigation:
 - The free-LLM induction reaches 3/7 (see `llm_induce.py`); stronger model/feedback closes the gap.
 - Energy/lives respawn is modeled enough to plan no-death solutions; full lives modeling is future work.
 
+## Source-free agent (`source_free_agent.py`, prototype)
+First cut at solving from **pixels + actions only** (no engine internals). Works: camera-static
+so screen==world; player centroid; **action→direction learned by probing** (ACTION1‑4 = U/D/L/R);
+connected-component candidates for slot/station (the true ones are among them). Open frontier —
+**color overloading**: one render color plays several roles, breaking naive color classification:
+color 4 = collision-walls *and* non-colliding void (→ "all color-4 = obstacle" over-blocks, BFS
+finds no path); color 5 = borders *and* the slot's exact deliver cell; color 9 = goal marker *and*
+decorations. Next fix: learn walkability + the exact deliver cell by **interaction** (move and
+watch if the player actually moved; wiggle around the slot until delivery fires) — build the map
+from experience, not from fragile color labels.
+
 ## Files
 - `ls20_solver.py` — model + planner + engine verification; `python ls20_solver.py` → solves 7/7.
 - `llm_induce.py` — local-LLM induction with plan-based APD refine loop.
-- `perception.py` — prototype pixel→symbol extractor (toward source-free transfer).
+- `perception.py` — pixel→symbol structure extractor (camera static; recovers obstacle map/player/slot).
+- `source_free_agent.py` — pixels-only agent prototype; characterizes the color-overloading frontier.
+- `SLIDES_zh.md` — Chinese presentation outline.
