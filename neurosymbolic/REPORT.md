@@ -111,14 +111,20 @@ blocked frontier), blue-marker-first, confirmed by the win signal.
   the far-from-body player-palette pixels (the HUD), compared **at the same position** so the
   color-9-overloaded slot markers cancel. L2's color and rotation stations are both detected.
 - **Config logic** verified on the engine: color×1 + rotation×3 → exactly the slot's `(5,1,3)`.
-- **Energy is the wall.** The full traversal (start → color stn → rotation stn → 3 cycles → slot) is
-  ~68 steps, but energy starts at 42 and drains −1/step; the agent dies en route and **death resets
-  the carried config**, so it never delivers. L2 needs **energy-aware routing through the refill
-  (`iri`) stations** (source-free detectable: the yellow energy bar grows on contact). That is the
-  next milestone. Multi-slot levels (L5) additionally need an intermediate-slot-solved detector.
+- **Energy is the wall — and it's a *hidden* variable.** The traversal (start → color → rotation → 3
+  cycles → slot) is ~68 steps, but energy starts at 42 and drains −1/step; the agent dies en route and
+  **death resets the carried config**, so it never delivers. Critically, **energy is not in the 64×64
+  render at all** (it drains 42→36 with *zero* pixel change) — a source-free agent cannot *read* it.
+  It can only **infer** it from the consequence: death teleports the player to start and resets the
+  config (both visible). So source-free L2 is a **hidden-state inference** problem: learn the budget
+  (EMAX — e.g. drive until a death/teleport) and the refill (`iri`) cells (a cell after which you can
+  travel > EMAX steps without dying), then plan energy-budgeted routes. This is qualitatively harder
+  than the fully-observable perception (position/stations/slots) already solved. Multi-slot levels (L5)
+  additionally need an intermediate-slot-solved detector.
 
-Reported honestly: **2/7 source-free end-to-end**; for L2 the perception and config reasoning are
-solved and only energy-budgeted planning remains. (With engine state the planner does 7/7.)
+Reported honestly: **2/7 source-free end-to-end**; for L2 the *observable* perception and config
+reasoning are solved, and the remaining gap is inferring a hidden resource (energy) from death events.
+(With engine state the planner does 7/7.)
 
 ## Files
 - `ls20_solver.py` — model + planner + engine verification; `python ls20_solver.py` → solves 7/7.

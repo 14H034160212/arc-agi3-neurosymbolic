@@ -39,12 +39,18 @@ L2 SOLVED IN PARTS — the remaining blocker is ENERGY, precisely isolated:
     colour-9-overloaded slot markers cancel. L2's colour station and rotation station are both found.
   * Config logic WORKS. Cycling colour x1 + rotation x3 reaches exactly the slot requirement (5,1,3),
     verified on the engine.
-  * BLOCKER = ENERGY. The full traversal (start -> colour stn -> rotation stn -> 3 cycles -> slot) is
-    ~68 steps but energy is 42 and -1/step; the agent dies en route, and DEATH RESETS THE CARRIED
-    CONFIG, so it never delivers. L2 needs ENERGY-AWARE ROUTING through the refill (iri) stations
-    (detectable source-free: the yellow energy bar grows). That is the next milestone.
+  * BLOCKER = ENERGY, AND ENERGY IS A HIDDEN VARIABLE. The full traversal (start -> colour stn ->
+    rotation stn -> 3 cycles -> slot) is ~68 steps but energy is 42 and -1/step; the agent dies en
+    route and DEATH RESETS THE CARRIED CONFIG, so it never delivers. Crucially, energy is NOT in the
+    64x64 render at all (it drains 42->36 with zero pixel change) -- a source-free agent cannot
+    *read* it. It can only INFER it from the consequence: death teleports the player back to start and
+    resets the config (both visible). So source-free L2 is a HIDDEN-STATE INFERENCE problem: learn the
+    energy budget (EMAX, e.g. drive until a death/teleport) and the refill (iri) cells (a cell after
+    which you can travel > EMAX steps without dying), then plan energy-budgeted routes. This is
+    qualitatively harder than the fully-observable perception (position/stations/slots) already solved.
 Multi-slot levels (e.g. L5) additionally need an intermediate-slot-solved detector. Honest status:
-2/7 pixels-only end-to-end; L2's perception/logic solved, only energy-budgeted planning remains.
+2/7 pixels-only end-to-end; L2's *observable* perception + config logic are solved, and the remaining
+gap is inference of a hidden resource (energy) from death events.
 """
 from __future__ import annotations
 import copy
