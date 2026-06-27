@@ -60,20 +60,33 @@ A **configuration-delivery puzzle**, *not* maze navigation:
 - The free-LLM induction reaches 3/7 (see `llm_induce.py`); stronger model/feedback closes the gap.
 - Energy/lives respawn is modeled enough to plan no-death solutions; full lives modeling is future work.
 
-## Source-free agent (`source_free_agent.py`, prototype)
-First cut at solving from **pixels + actions only** (no engine internals). Works: camera-static
-so screen==world; player centroid; **action→direction learned by probing** (ACTION1‑4 = U/D/L/R);
-connected-component candidates for slot/station (the true ones are among them). Open frontier —
-**color overloading**: one render color plays several roles, breaking naive color classification:
-color 4 = collision-walls *and* non-colliding void (→ "all color-4 = obstacle" over-blocks, BFS
-finds no path); color 5 = borders *and* the slot's exact deliver cell; color 9 = goal marker *and*
-decorations. Next fix: learn walkability + the exact deliver cell by **interaction** (move and
-watch if the player actually moved; wiggle around the slot until delivery fires) — build the map
-from experience, not from fragile color labels.
+## Source-free agent (`source_free_agent.py`) — ✅ solves L0 from pixels only
+Solves `ls20` level 0 **end-to-end from pixels + actions only** (16 actions): every decision uses
+only the rendered grid + the environment's win/lose feedback; no engine internals are read for
+planning. Three insights cracked it, after color-based perception failed:
+
+- **Color overloading defeats naive perception.** One render color plays several roles — color 4 =
+  collision-walls *and* non-colliding void; color 5 = borders *and* the deliver cell; color 9 = the
+  goal marker *and* decorations. So you cannot label walkability/goals by color.
+- **Dead-reckon position by the *learned action direction*, not the orange centroid.** The player is
+  the orange carried sprite, whose shape *rotates at stations*, so its centroid jumps on a config
+  cycle. Instead we learn each action's direction once (probe in free space) and track position by
+  "did the blob change at all?" (moved 5 px in that known direction) vs "identical" (blocked). This
+  is immune to the redraw — the exact wall the earlier prototype hit.
+- **A station can be pixel-invisible; the win is the oracle.** L0's rotation station cycles rot 3→0,
+  but for this shape rot-3 and rot-0 render to the *same* pixels — the config change is real (the
+  slot rejects rot 3, accepts rot 0) yet invisible. And an unsolved slot *blocks* movement (5×5 box
+  reject) until the config matches, so it reads as a wall. So we record **blocked frontiers**, then
+  brute a pass-through "station candidate" over the reachable cells and retry each blocked frontier;
+  the combination that **wins** (environment feedback) reveals both the station and the slot.
+
+Pipeline: learn action dirs → explore the freely-reachable graph by deterministic RESET+replay →
+brute (pass-through cell × blocked frontier), confirmed by the win signal. This closes the
+source-free loop the earlier prototype only characterised.
 
 ## Files
 - `ls20_solver.py` — model + planner + engine verification; `python ls20_solver.py` → solves 7/7.
 - `llm_induce.py` — local-LLM induction with plan-based APD refine loop.
 - `perception.py` — pixel→symbol structure extractor (camera static; recovers obstacle map/player/slot).
-- `source_free_agent.py` — pixels-only agent prototype; characterizes the color-overloading frontier.
+- `source_free_agent.py` — pixels-only agent; **solves L0 end-to-end from the render + win feedback**.
 - `SLIDES_zh.md` — Chinese presentation outline.
