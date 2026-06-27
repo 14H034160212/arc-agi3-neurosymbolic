@@ -42,8 +42,18 @@ next). L0 = 1 rotation cycle (D=1); L1 = 3 rotation cycles (D=1); L2 = colour + 
 through refills (D=2); L3 (D=2); L4 = shape + colour + rotation (D=3). The search is FRONTIER-OUTER,
 interleaving D=1/2/3 station-cycle combos over the detected stations, delivery cells ordered by the
 blue slot-marker. With engine state (ls20_solver.py) all 7 solve; PIXELS-ONLY now reaches 5/7.
-Remaining: L5 has TWO slots -> needs an intermediate-slot-solved detector (a single delivery doesn't
-advance the level); L6 is the last level (win = GameState.WIN).
+
+MULTI-SLOT (L5) — infrastructure built, search not yet converging: L5 has TWO slots with different
+configs, so a single delivery doesn't win. We detect a solved slot ROBUSTLY by a DROP in the
+marker-component count (solving turns a slot's requirement marker inert; player/sub-blob drift can
+only ADD a component, never remove one -> no false positives), and chain sub-goals (solve slot1,
+re-explore from that state, solve slot2). Tractability fixes: index-ordered station COMBINATIONS (not
+permutations), dedup stations to one cyclable rep, MAXK=6 (shape needs 0->5). L5 engages correctly
+(detects 2 slots) but the per-slot D=3 + energy search doesn't find slot1's config within budget.
+NEXT: compute exact cycle counts instead of brute-searching k — the slot marker ENCODES the required
+colour (colour-9 -> tmx 1, colour-8 -> tmx 3), and the rotation station is the one with no HUD change,
+so colour/shape/rotation cycles can be derived, collapsing the search. L6 = single-slot D=3 (win =
+GameState.WIN) — solvable by the current agent once it can chain past L5.
 """
 from __future__ import annotations
 import copy
@@ -169,9 +179,26 @@ def learn_dirs(verbose=True):
     assert sorted(DIR.values()) == sorted(CARD), f"failed to learn all four directions: {DIR}"
     return DIR
 
-def solve_level(level, prefix=(), dirs=None, trial_cap=8000, time_cap=160.0, verbose=True):
+MARKER_COLORS = [9, 14, 8]    # carried-palette colours used as slot-requirement markers (not the body-12)
+
+def count_markers(grid, body_center):
+    """Count the slots' requirement-marker COMPONENTS, excluding the player neighbourhood and the
+    bottom-left carried HUD corner. A delivery that SOLVES a slot turns its marker inert -> the count
+    DROPS by one. We detect intermediate slot solves by a DECREASE (robust: player/sub-blob drift can
+    only add a component, never remove one — so it can't cause a false 'solved')."""
+    n = 0
+    for col in MARKER_COLORS:
+        for (cx, cy, _) in comps_centroids(grid, col, 3):
+            if abs(cx-body_center[0]) + abs(cy-body_center[1]) > 12 and not (cx < 18 and cy > 50):
+                n += 1
+    return n
+
+def solve_level(level, prefix=(), dirs=None, trial_cap=8000, time_cap=160.0, verbose=True,
+                partial_ok=False, maxk=4):
     """Solve one ls20 level from pixels + win/lose feedback only.
-    `prefix` = known winning actions for earlier levels; `dirs` = learned action->direction map."""
+    `prefix` = known winning actions for earlier levels; `dirs` = learned action->direction map.
+    `partial_ok` (multi-slot): accept a move that solves ONE slot (detected by slot_state change),
+    not just a full win; the caller then chains sub-goals. `maxk` = max station cycles to try."""
     Ls20 = _ls20(); from arcengine import GameAction, ActionInput
     AIN = {a: ActionInput(id=getattr(GameAction, a)) for a in ACTS}
     RESET = ActionInput(id=GameAction.RESET)
@@ -385,7 +412,19 @@ def solve_level(level, prefix=(), dirs=None, trial_cap=8000, time_cap=160.0, ver
                 if r is None: return None
             p, e = r; full += p; pos = wp
         return full + [deliver] if e >= 2 else None
-    MAXK = 4
+    MAXK = maxk
+
+    # success check: full win (fast), or (multi-slot only) a newly-solved slot (slower, pixel-based).
+    # Only enable the partial path when the level ACTUALLY has >=2 slot markers, else single-slot
+    # levels mis-fire on spurious slot_state changes (a real single-slot solve is already a full win).
+    n_slots = count_markers(g0, P0)
+    eff_partial = partial_ok and n_slots >= 2
+    if verbose and partial_ok: print(f"L{level}: slot markers detected = {n_slots} (partial={'on' if eff_partial else 'off'})")
+    def success(sol):
+        if run_fast(sol): return (True, True)        # fast path: full win
+        if not eff_partial: return (False, True)
+        _, pc, _, _, grid = trace(sol)               # slow path: did the marker count DROP (slot solved)?
+        return (count_markers(grid, pc) < n_slots, False)
 
     import os
     if os.environ.get("SF_DEBUG_COMBO"):         # "c1x,c1y,k1,c2x,c2y,k2" -> diagnose this combo
@@ -405,36 +444,44 @@ def solve_level(level, prefix=(), dirs=None, trial_cap=8000, time_cap=160.0, ver
     # DETECTED stations (small), which is why D=1 no longer drowns the search (the earlier bug: 65
     # cells x 86 frontiers exhausted the budget before D=2 even started).
     Cs = detected_stations or cells[:14]
+    if maxk > 4 and len(Cs) > 3:                  # multi-slot D=3: dedup to one cyclable rep per station
+        reps = []
+        for p in sorted(Cs, key=lambda c: -depth(c)):
+            if all(abs(p[0]-r[0]) + abs(p[1]-r[1]) > 5 for r in reps) and cyc_wps(p, 2) is not None:
+                reps.append(p)
+        if reps: Cs = reps
+        if verbose: print(f"L{level}: station reps (deduped) {Cs}")
     res = None; status = "exhausted"
+    # Stations control INDEPENDENT attributes, so cycling order doesn't change the final config ->
+    # use index-ordered COMBINATIONS of stations (not permutations); only the cycle counts are searched.
+    krange = range(1, MAXK + 1)
     def combos_for(cell, a):
-        for C in Cs:                                   # D=1
-            for k in range(1, MAXK + 1):
-                w = cyc_wps(C, k)
+        n = len(Cs)
+        for i in range(n):                             # D=1
+            for k in krange:
+                w = cyc_wps(Cs[i], k)
                 if w is not None: yield (w + [cell], a, 1)
-        for C1 in Cs:                                  # D=2
-            for k1 in range(1, MAXK + 1):
-                w1 = cyc_wps(C1, k1)
-                if w1 is None: continue
-                for C2 in Cs:
-                    if C2 == C1: continue
-                    for k2 in range(1, MAXK + 1):
-                        w2 = cyc_wps(C2, k2)
+        for i in range(n):                             # D=2 (i<j)
+            for j in range(i + 1, n):
+                for k1 in krange:
+                    w1 = cyc_wps(Cs[i], k1)
+                    if w1 is None: continue
+                    for k2 in krange:
+                        w2 = cyc_wps(Cs[j], k2)
                         if w2 is not None: yield (w1 + w2 + [cell], a, 2)
-        for C1 in Cs:                                  # D=3 (e.g. L4: shape + colour + rotation)
-            for k1 in range(1, MAXK + 1):
-                w1 = cyc_wps(C1, k1)
-                if w1 is None: continue
-                for C2 in Cs:
-                    if C2 == C1: continue
-                    for k2 in range(1, MAXK + 1):
-                        w2 = cyc_wps(C2, k2)
-                        if w2 is None: continue
-                        for C3 in Cs:
-                            if C3 == C1 or C3 == C2: continue
-                            for k3 in range(1, MAXK + 1):
-                                w3 = cyc_wps(C3, k3)
+        for i in range(n):                             # D=3 (i<j<l) — e.g. L4: shape + colour + rotation
+            for j in range(i + 1, n):
+                for l in range(j + 1, n):
+                    for k1 in krange:
+                        w1 = cyc_wps(Cs[i], k1)
+                        if w1 is None: continue
+                        for k2 in krange:
+                            w2 = cyc_wps(Cs[j], k2)
+                            if w2 is None: continue
+                            for k3 in krange:
+                                w3 = cyc_wps(Cs[l], k3)
                                 if w3 is not None: yield (w1 + w2 + w3 + [cell], a, 3)
-    trials = 0
+    trials = 0; fully = True
     for fr in frontiers:
         if res is not None: break
         cell, a = fr
@@ -444,20 +491,38 @@ def solve_level(level, prefix=(), dirs=None, trial_cap=8000, time_cap=160.0, ver
             sol = realize(wps, da)
             if sol is None: continue
             trials += 1
-            if run_fast(sol):
-                res = (sol, ftgt(fr), dval); status = "won"; break
+            ok, won_full = success(sol)
+            if ok:
+                res = (sol, ftgt(fr), dval); status = "won"; fully = won_full; break
         if status == "capped": break
 
     dt = time.time() - t0
     if res:
         sol, slot_at, dval = res
         if verbose:
-            print(f"  ✅ SOLVED L{level} FROM PIXELS ONLY — {len(sol)} actions, {trials} trials, "
+            tag = "SOLVED" if fully else "solved one slot of"
+            print(f"  ✅ {tag} L{level} FROM PIXELS ONLY — {len(sol)} actions, {trials} trials, "
                   f"D={dval}, {dt:.0f}s; slot @ {slot_at}")
-        return True, dict(level=level, actions=len(sol), trials=trials, D=dval, secs=round(dt, 1), sol=sol)
+        return True, dict(level=level, actions=len(sol), trials=trials, D=dval, secs=round(dt, 1),
+                          sol=sol, fully_won=fully)
     if verbose:
         print(f"  ❌ L{level}: no winning combination ({trials} trials, {status}, {dt:.0f}s)")
     return False, dict(level=level, trials=trials, status=status, secs=round(dt, 1))
+
+def solve_level_full(level, prefix, DIR, maxk=4, max_subgoals=4, time_cap=160.0):
+    """Solve a level fully, chaining SUB-GOALS for multi-slot levels: each solve_level(partial_ok)
+    call solves one more slot (or wins); we extend a within-level prefix and re-run until won."""
+    sub = []; total_trials = 0; t0 = time.time()
+    for _ in range(max_subgoals):
+        ok, info = solve_level(level, prefix=tuple(prefix) + tuple(sub), dirs=DIR,
+                               partial_ok=True, maxk=maxk, time_cap=time_cap, verbose=True)
+        if not ok:
+            return False, dict(level=level, trials=total_trials, secs=round(time.time()-t0, 1))
+        sub += info["sol"]; total_trials += info["trials"]
+        if info.get("fully_won"):
+            return True, dict(level=level, actions=len(sub), trials=total_trials,
+                              secs=round(time.time()-t0, 1), sol=sub)
+    return False, dict(level=level, trials=total_trials, status="max_subgoals")
 
 def main():
     import sys
@@ -465,7 +530,8 @@ def main():
     DIR = learn_dirs()
     results = []; prefix = []
     for lv in levels:
-        ok, info = solve_level(lv, prefix=tuple(prefix), dirs=DIR)
+        ok, info = solve_level_full(lv, prefix, DIR, maxk=6 if lv >= 5 else 4,
+                                    time_cap=420.0 if lv >= 5 else 160.0)
         results.append((lv, ok, info)); print()
         if ok:
             prefix += info["sol"]
@@ -475,7 +541,7 @@ def main():
     nsolved = sum(1 for _, ok, _ in results if ok)
     for lv, ok, info in results:
         tag = "✅" if ok else "❌"
-        extra = (f"{info['actions']} acts, {info['trials']} trials, D={info['D']}, {info['secs']}s"
+        extra = (f"{info['actions']} acts, {info['trials']} trials, {info['secs']}s"
                  if ok else f"{info.get('trials','?')} trials, {info.get('status','')}, {info.get('secs','?')}s")
         print(f"  {tag} L{lv}: {extra}")
     print(f"  TOTAL: {nsolved} consecutive levels solved source-free (chained from L0)")

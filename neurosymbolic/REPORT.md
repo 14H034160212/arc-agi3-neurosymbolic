@@ -124,12 +124,22 @@ Two more mechanisms unlocked L2–L4:
   other stations so the carried config isn't perturbed. Death resets the config, so staying alive is
   part of the plan. This cracked the ~68-step L2 route and the multi-station L3/L4.
 
-**Remaining (L5, L6):** L5 has **two slots** — a single delivery doesn't advance the level, so it needs
-an *intermediate-slot-solved detector* (a slot marker turning inert is visible). L6 is the last level
-(win = `GameState.WIN`). Reported honestly: **5/7 source-free end-to-end** (7/7 with engine state).
-The progression is itself the result: the agent self-discovers position, stations, slots, multi-step
-configuration, *and* a hidden resource — exactly the "infer the hidden rules from consequences" skill
-ARC-AGI-3 targets.
+**Multi-slot (L5) — infrastructure built, search not yet converging.** L5 has **two slots** with
+different configs, so a single delivery doesn't win. We detect a solved slot **robustly by a drop in
+the marker-component count** (solving turns a slot's requirement marker inert; player/sub-blob drift
+can only *add* a component, never remove one → no false positives), and **chain sub-goals** (solve
+slot 1, re-explore from that state, solve slot 2). Tractability fixes were added — index-ordered
+station *combinations* (not permutations), dedup to one cyclable rep per station, `MAXK=6` (shape needs
+0→5). L5 **engages correctly** (detects 2 slots, no false solves) but the per-slot D=3 + energy search
+doesn't find slot 1's config within budget. The clear next step: **compute exact cycle counts instead
+of brute-searching** — the slot marker *encodes the required color* (color-9→tmx 1, color-8→tmx 3) and
+the rotation station is the one with no HUD change, so the color/shape/rotation cycles can be derived,
+collapsing the search. L6 is single-slot D=3 (win = `GameState.WIN`) — solvable by the current agent
+once it can chain past L5.
+
+Reported honestly: **5/7 source-free end-to-end** (7/7 with engine state). The progression is itself
+the result: the agent self-discovers position, stations, slots, multi-step configuration, *and* a
+hidden resource — exactly the "infer the hidden rules from consequences" skill ARC-AGI-3 targets.
 
 ## Files
 - `ls20_solver.py` — model + planner + engine verification; `python ls20_solver.py` → solves 7/7.
