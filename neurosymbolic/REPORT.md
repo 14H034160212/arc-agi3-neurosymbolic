@@ -104,13 +104,21 @@ Pipeline: learn dirs once → per level, checkpoint at start via prefix → expl
 graph by deterministic replay (dead-reckoned, color-agnostic) → search (station candidate × cycles ×
 blocked frontier), blue-marker-first, confirmed by the win signal.
 
-**L2 is the frontier.** It needs *two* stations (color 0→1 *and* rotation 0→3). Two obstacles remain:
-(a) the color change is in the carried sub-blob, and signature-based station detection is confounded
-because **color-9 is overloaded** (player palette *and* the slot marker), so a slot marker near the
-player looks like a station; (b) the two-station search is large and times out without clean station
-candidates. Next: disambiguate stations from slots (a station *persistently* changes the carried
-config; a slot *blocks*), then prune the search to the few real stations. Multi-slot levels (L5) also
-need an intermediate-slot-solved detector. This is reported honestly — 2/7 source-free, not a claim of 7.
+**L2: perception + logic solved; the only remaining blocker is energy.** It needs *two* stations
+(color 0→1 *and* rotation 0→3). Cracked along the way:
+- **Station detection.** The carried config is rendered in a **fixed HUD inventory panel** (a corner),
+  not on the player sprite. So a station is a cell whose *on-and-back* touch **persistently** changes
+  the far-from-body player-palette pixels (the HUD), compared **at the same position** so the
+  color-9-overloaded slot markers cancel. L2's color and rotation stations are both detected.
+- **Config logic** verified on the engine: color×1 + rotation×3 → exactly the slot's `(5,1,3)`.
+- **Energy is the wall.** The full traversal (start → color stn → rotation stn → 3 cycles → slot) is
+  ~68 steps, but energy starts at 42 and drains −1/step; the agent dies en route and **death resets
+  the carried config**, so it never delivers. L2 needs **energy-aware routing through the refill
+  (`iri`) stations** (source-free detectable: the yellow energy bar grows on contact). That is the
+  next milestone. Multi-slot levels (L5) additionally need an intermediate-slot-solved detector.
+
+Reported honestly: **2/7 source-free end-to-end**; for L2 the perception and config reasoning are
+solved and only energy-budgeted planning remains. (With engine state the planner does 7/7.)
 
 ## Files
 - `ls20_solver.py` — model + planner + engine verification; `python ls20_solver.py` → solves 7/7.

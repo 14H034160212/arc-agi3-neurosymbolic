@@ -32,15 +32,19 @@ tracking (hint-colour continuity + centroid-closeness, robust to the carried-obj
 blue-component slot prioritisation. With engine state (ls20_solver.py) all 7 solve; this file
 measures how far PIXELS-ONLY reaches: 2/7.
 
-L2 IS THE FRONTIER (precisely characterised): it needs TWO stations — a colour station (gic, carried
-colour 0->1) AND a rotation station (bgt, 0->3). Two source-free obstacles remain: (a) the colour
-change lives in the CARRIED sub-blob, not the orange body, and signature-based station detection is
-confounded because colour-9 is OVERLOADED (player-palette AND the slot marker) — so a slot marker
-entering the signature window looks like a station; (b) the two-station search (which cell x how many
-cycles, twice) is large and times out without clean station candidates. Next: disambiguate stations
-from slots (a station persistently changes the carried config; a slot blocks), then prune the search
-to the few real station cells. Multi-slot levels (e.g. L5) additionally need an intermediate-slot
-detector. This file is the honest measure of the source-free frontier, not an over-claim.
+L2 SOLVED IN PARTS — the remaining blocker is ENERGY, precisely isolated:
+  * Station detection WORKS. The carried config is shown in a FIXED HUD inventory panel (a corner),
+    not on the player sprite — so we detect a station as a cell whose on-and-back touch PERSISTENTLY
+    changes the far-from-body player-palette pixels (the HUD), compared at the SAME position so the
+    colour-9-overloaded slot markers cancel. L2's colour station and rotation station are both found.
+  * Config logic WORKS. Cycling colour x1 + rotation x3 reaches exactly the slot requirement (5,1,3),
+    verified on the engine.
+  * BLOCKER = ENERGY. The full traversal (start -> colour stn -> rotation stn -> 3 cycles -> slot) is
+    ~68 steps but energy is 42 and -1/step; the agent dies en route, and DEATH RESETS THE CARRIED
+    CONFIG, so it never delivers. L2 needs ENERGY-AWARE ROUTING through the refill (iri) stations
+    (detectable source-free: the yellow energy bar grows). That is the next milestone.
+Multi-slot levels (e.g. L5) additionally need an intermediate-slot-solved detector. Honest status:
+2/7 pixels-only end-to-end; L2's perception/logic solved, only energy-budgeted planning remains.
 """
 from __future__ import annotations
 import copy
@@ -97,17 +101,19 @@ def player_at(grid, near, hint, tol):
             return best
     return None
 
-def signature(grid, center):
-    """The player 'signature': all player-palette blobs near `center`, as colours + size at relative
-    lattice offsets. Captures the CARRIED object (a sub-blob beside the orange body) whose colour/
-    shape a station changes — the body itself never recolours, so we watch the whole constellation.
-    A station shows up as a signature change beyond pure translation (invisible rotations excepted)."""
+def hud_sig(grid, body_center):
+    """Signature of the carried-object state, read from the FIXED HUD inventory panel (ls20 renders
+    the carried object's colour/shape in a corner, NOT on the player sprite). We take all player-
+    palette pixels FAR from the body: across two frames at the SAME player position, static walls/
+    slots/decor cancel, the moving body is excluded, and only a persistent carried-config change (the
+    HUD indicator recolouring/reshaping) survives. Robust to the colour-9 overload."""
     sig = []
     for col in PCOLORS:
-        for (cx, cy, sz) in comps_centroids(grid, col, 3):
-            if abs(cx - center[0]) + abs(cy - center[1]) <= 8:
-                sig.append((col, round((cx-center[0])/5)*5, round((cy-center[1])/5)*5, sz))
-    return tuple(sorted(sig))
+        ys, xs = np.where(grid == col)
+        for x, y in zip(xs.tolist(), ys.tolist()):
+            if abs(x - body_center[0]) + abs(y - body_center[1]) > 12:
+                sig.append((col, x, y))
+    return frozenset(sig)
 
 def find_start_player(base, DIR, AIN):
     """Identify the player at a level start as the blob that TRANSLATES by a known action's vector
@@ -198,28 +204,40 @@ def solve_level(level, prefix=(), dirs=None, trial_cap=8000, time_cap=160.0, ver
         dexp = abs(c[0]-exp[0]) + abs(c[1]-exp[1]); dpc = abs(c[0]-pc[0]) + abs(c[1]-pc[1])
         return (exp, cand[2]) if dexp < dpc else None
 
-    def run(path):
+    def trace(path):
         """Execute RESET+prefix+path (via the cached checkpoint); track the player colour-agnostically.
-        Return (dead_reckon_pos, won_bool)."""
-        gg = copy.deepcopy(base); pc, col, pos = P0, COL0, (0, 0)
+        Return (dead_reckon_pos, body_centre_screen, colour, won, final_grid)."""
+        gg = copy.deepcopy(base); pc, col, pos = P0, COL0, (0, 0); grid = render(gg)
         for a in path:
             gg.perform_action(AIN[a]); grid = render(gg)
             mv = classify(grid, pc, col, a)
             if mv:
                 pc, col = mv; pos = (pos[0]+DIR[a][0], pos[1]+DIR[a][1])
             if won(gg):
-                return pos, True
-        return pos, False
+                return pos, pc, col, True, grid
+        return pos, pc, col, False, grid
+
+    def run(path):
+        pos, _, _, w, _ = trace(path); return pos, w
+
+    def run_fast(path):
+        """Execute a planned action sequence and report only WIN (environment feedback). No pixel
+        tracking — the sequence was already planned from the pixel-derived graph; this just asks the
+        environment 'did it win?'. Much faster than trace (no get_pixels), used for the search."""
+        gg = copy.deepcopy(base)
+        for a in path:
+            gg.perform_action(AIN[a])
+            if won(gg): return True
+        return False
 
     # --- explore the freely-reachable graph; record cells, blocked frontiers, VISIBLE stations
     start = (0, 0)
     ckpt = {start: (copy.deepcopy(base), P0, COL0)}
     paths = {start: []}; edges = {}; order = [start]; i = 0
-    blocked = []; vis_stations = set()
+    blocked = []
     while i < len(order) and len(order) < 200:
         cell = order[i]; i += 1
         gC, pcC, colC = ckpt[cell]
-        sig0 = signature(render(gC), pcC)
         edges[cell] = {}
         for a in ACTS:
             gg = copy.deepcopy(gC); gg.perform_action(AIN[a]); grid = render(gg)
@@ -228,13 +246,11 @@ def solve_level(level, prefix=(), dirs=None, trial_cap=8000, time_cap=160.0, ver
                 blocked.append((cell, a)); continue       # wall or unsolved-slot reject
             exp, ncol = mv
             npos = (cell[0] + DIR[a][0], cell[1] + DIR[a][1])
-            if signature(grid, exp) != sig0:
-                vis_stations.add(npos)                     # carried config changed -> a (visible) station
             edges[cell][a] = npos
             if npos not in paths:
                 paths[npos] = paths[cell] + [a]; ckpt[npos] = (gg, exp, ncol); order.append(npos)
     if verbose:
-        print(f"L{level}: explored {len(paths)} cells; blocked={len(blocked)}; visible stations={sorted(vis_stations)}")
+        print(f"L{level}: explored {len(paths)} cells; blocked frontiers={len(blocked)}")
 
     def bfs(src, dst):
         if src == dst: return []
@@ -262,6 +278,32 @@ def solve_level(level, prefix=(), dirs=None, trial_cap=8000, time_cap=160.0, ver
             for b, m in edges.get(nb, {}).items():
                 if m == C: return [a, b]
         return None
+
+    # --- disambiguate STATIONS from slots/refills/walls: a station PERSISTENTLY changes the carried
+    # config. Probe each reachable cell X by stepping onto it and back to a neighbour A, comparing the
+    # player signature AT A before vs after. Static slot markers (colour-9 overload!) sit at the same
+    # screen position both times -> they cancel; only a real carried-config change survives.
+    def find_stations():
+        sts = []
+        nbr = {}                                      # X -> (A, action A->X)
+        for A in paths:
+            for a, X in edges.get(A, {}).items():
+                if X != A and X not in nbr:
+                    nbr[X] = (A, a)
+        for X, (A, a) in nbr.items():
+            if time.time() - t0 > time_cap * 0.5: break
+            b = next((x for x in ACTS if DIR[x] == (-DIR[a][0], -DIR[a][1])), None)
+            if b is None: continue
+            _, cenA, _, _, gA = trace(paths[A])
+            _, cenA2, _, w2, gA2 = trace(paths[A] + [a, b])
+            if w2 or abs(cenA2[0]-cenA[0]) + abs(cenA2[1]-cenA[1]) > 2:
+                continue                              # didn't cleanly return to A
+            if hud_sig(gA2, cenA2) != hud_sig(gA, cenA):
+                sts.append(X)                         # carried config changed for good -> a station
+        return sts
+    detected_stations = sorted(set(find_stations()), key=lambda c: -depth(c))
+    if verbose: print(f"L{level}: detected stations (persistent config change) {detected_stations}")
+
     def cycle_path(C, k):
         bp = bfs(start, C)
         if bp is None: return None
@@ -281,7 +323,7 @@ def solve_level(level, prefix=(), dirs=None, trial_cap=8000, time_cap=160.0, ver
             leg = bfs(pre[1], cell)
             if leg is None: continue
             sol = pre[0] + leg + [a]; trials += 1
-            if run(sol)[1]:
+            if run_fast(sol):
                 return ("won", (sol, pre[2], ftgt((cell, a)), dval))
         return ("exhausted", None)
 
@@ -291,26 +333,29 @@ def solve_level(level, prefix=(), dirs=None, trial_cap=8000, time_cap=160.0, ver
     g1 = ((one(C, k), fr) for fr in frontiers for C in cells for k in range(1, MAXK + 1))
     status, res = try_combos(g1, 1)
 
-    # D=2: a VISIBLE station (cycled k1) then any cell as the rotation station (cycled k2) — L2
+    # D=2: two stations, each cycled. Both L2 stations (colour + rotation) are detected, so search
+    # detected x detected FIRST (small); fall back to detected x all-cells for any undetected station.
+    def two(C1, k1, C2, k2):
+        def b():
+            cp = cycle_path(C1, k1)
+            if cp is None: return None
+            leg = bfs(C1, C2)
+            if leg is None: return None
+            cp = cp + leg
+            if k2 > 1:
+                ob = offback(C2)
+                if ob is None: return None
+                cp = cp + ob * (k2 - 1)
+            return (cp, C2, [(C1, k1), (C2, k2)])
+        return b
     if status != "won":
-        vis = sorted(vis_stations, key=lambda c: -depth(c)) or cells[:12]
-        def two(C1, k1, C2, k2):
-            def b():
-                cp = cycle_path(C1, k1)
-                if cp is None: return None
-                leg = bfs(C1, C2)
-                if leg is None: return None
-                cp = cp + leg
-                if k2 > 1:
-                    ob = offback(C2)
-                    if ob is None: return None
-                    cp = cp + ob * (k2 - 1)
-                return (cp, C2, [(C1, k1), (C2, k2)])
-            return b
-        g2 = ((two(c1, k1, c2, k2), fr) for fr in frontiers
-              for c1 in vis for k1 in range(1, MAXK + 1)
-              for c2 in cells for k2 in range(1, MAXK + 1))
-        status, res = try_combos(g2, 2)
+        c1set = detected_stations or cells[:12]
+        for c2set in ([detected_stations] if detected_stations else []) + [cells]:
+            g2 = ((two(c1, k1, c2, k2), fr) for fr in frontiers
+                  for c1 in c1set for k1 in range(1, MAXK + 1)
+                  for c2 in c2set for k2 in range(1, MAXK + 1) if c2 != c1)
+            status, res = try_combos(g2, 2)
+            if status == "won": break
 
     dt = time.time() - t0
     if res:
