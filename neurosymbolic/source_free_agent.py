@@ -25,32 +25,25 @@ THE INSIGHTS THAT MAKE A SOURCE-FREE SOLVE WORK:
    To work on level k we PREFIX every replay with the known winning solutions for L0..L(k-1)
    (cached as a deepcopy checkpoint == RESET + replay). Solutions chain level by level.
 
-RESULT (pixels + win/lose feedback only): solves ls20 L0 and L1 END-TO-END, chained (win L0 to reach
-L1). L0 = one rotation cycle; L1 = three rotation cycles via the off-and-back cycling maneuver. The
-full perception stack works: action->direction by elimination, colour-agnostic multi-part player
-tracking (hint-colour continuity + centroid-closeness, robust to the carried-object sub-blob), and
-blue-component slot prioritisation. With engine state (ls20_solver.py) all 7 solve; this file
-measures how far PIXELS-ONLY reaches: 2/7.
+5) STATIONS ARE READ FROM A FIXED HUD PANEL; the carried config is rendered in a corner inventory,
+   not on the player sprite. A station = a cell whose on-and-back touch PERSISTENTLY changes the
+   far-from-body player-palette pixels (the HUD), compared at the SAME position so the colour-9-
+   overloaded slot markers cancel. The win signal then confirms which stations/cycles deliver.
 
-L2 SOLVED IN PARTS — the remaining blocker is ENERGY, precisely isolated:
-  * Station detection WORKS. The carried config is shown in a FIXED HUD inventory panel (a corner),
-    not on the player sprite — so we detect a station as a cell whose on-and-back touch PERSISTENTLY
-    changes the far-from-body player-palette pixels (the HUD), compared at the SAME position so the
-    colour-9-overloaded slot markers cancel. L2's colour station and rotation station are both found.
-  * Config logic WORKS. Cycling colour x1 + rotation x3 reaches exactly the slot requirement (5,1,3),
-    verified on the engine.
-  * BLOCKER = ENERGY, AND ENERGY IS A HIDDEN VARIABLE. The full traversal (start -> colour stn ->
-    rotation stn -> 3 cycles -> slot) is ~68 steps but energy is 42 and -1/step; the agent dies en
-    route and DEATH RESETS THE CARRIED CONFIG, so it never delivers. Crucially, energy is NOT in the
-    64x64 render at all (it drains 42->36 with zero pixel change) -- a source-free agent cannot
-    *read* it. It can only INFER it from the consequence: death teleports the player back to start and
-    resets the config (both visible). So source-free L2 is a HIDDEN-STATE INFERENCE problem: learn the
-    energy budget (EMAX, e.g. drive until a death/teleport) and the refill (iri) cells (a cell after
-    which you can travel > EMAX steps without dying), then plan energy-budgeted routes. This is
-    qualitatively harder than the fully-observable perception (position/stations/slots) already solved.
-Multi-slot levels (e.g. L5) additionally need an intermediate-slot-solved detector. Honest status:
-2/7 pixels-only end-to-end; L2's *observable* perception + config logic are solved, and the remaining
-gap is inference of a hidden resource (energy) from death events.
+6) ENERGY IS A HIDDEN VARIABLE — it is NOT in the 64x64 render at all (drains with zero pixel change).
+   We measure it source-free with an ORACLE: spam moves until the player dies and teleports back to
+   start; the step count IS the energy (-1/step) -> EMAX. Refills (iri) ARE visible (colour-11) and
+   reset energy to EMAX. Routing is then energy-aware Dijkstra over (cell, energy) with PROACTIVE
+   refuelling (min-steps alone would arrive drained and strand the long final leg), avoiding other
+   stations so the carried config isn't perturbed. Death resets the config, so staying alive matters.
+
+RESULT (pixels + win/lose feedback only): solves ls20 L0-L4 END-TO-END, chained (win each to reach the
+next). L0 = 1 rotation cycle (D=1); L1 = 3 rotation cycles (D=1); L2 = colour + rotation, energy-routed
+through refills (D=2); L3 (D=2); L4 = shape + colour + rotation (D=3). The search is FRONTIER-OUTER,
+interleaving D=1/2/3 station-cycle combos over the detected stations, delivery cells ordered by the
+blue slot-marker. With engine state (ls20_solver.py) all 7 solve; PIXELS-ONLY now reaches 5/7.
+Remaining: L5 has TWO slots -> needs an intermediate-slot-solved detector (a single delivery doesn't
+advance the level); L6 is the last level (win = GameState.WIN).
 """
 from __future__ import annotations
 import copy
@@ -61,7 +54,7 @@ from pathlib import Path
 import numpy as np
 
 ENV = Path(__file__).resolve().parent.parent / "environment_files/ls20/cb3b57cc/ls20.py"
-SLOT, LAST_LEVEL = 9, 6
+SLOT, REFILL, LAST_LEVEL = 9, 11, 6
 PCOLORS = [12, 9, 14, 8]          # carried-object palette (hul): the player is always one of these
 ACTS = ["ACTION1", "ACTION2", "ACTION3", "ACTION4"]
 
@@ -278,13 +271,6 @@ def solve_level(level, prefix=(), dirs=None, trial_cap=8000, time_cap=160.0, ver
     cells = sorted(paths.keys(), key=lambda c: -depth(c))
     if verbose: print(f"L{level}: blue markers (dead-reckon) {blue_dr}")
 
-    def offback(C):
-        for a, nb in edges.get(C, {}).items():
-            if nb == C: continue
-            for b, m in edges.get(nb, {}).items():
-                if m == C: return [a, b]
-        return None
-
     # --- disambiguate STATIONS from slots/refills/walls: a station PERSISTENTLY changes the carried
     # config. Probe each reachable cell X by stepping onto it and back to a neighbour A, comparing the
     # player signature AT A before vs after. Static slot markers (colour-9 overload!) sit at the same
@@ -310,65 +296,164 @@ def solve_level(level, prefix=(), dirs=None, trial_cap=8000, time_cap=160.0, ver
     detected_stations = sorted(set(find_stations()), key=lambda c: -depth(c))
     if verbose: print(f"L{level}: detected stations (persistent config change) {detected_stations}")
 
-    def cycle_path(C, k):
-        bp = bfs(start, C)
-        if bp is None: return None
-        if k <= 1: return bp
-        ob = offback(C)
-        return None if ob is None else bp + ob * (k - 1)
+    # --- ENERGY (a HIDDEN variable — not in the render). Refills ARE visible (colour-11 markers) and
+    # reset energy to EMAX. We measure EMAX source-free with an oracle: spam moves until the player
+    # dies and teleports back to start; the step count IS the energy at that cell (−1/step).
+    refills = set()
+    for (cx, cy, _) in comps_centroids(g0, REFILL):
+        rc = (round((cx - P0[0]) / 5) * 5, round((cy - P0[1]) / 5) * 5)
+        near = min(paths, key=lambda c: abs(c[0]-rc[0]) + abs(c[1]-rc[1]), default=None)
+        if near is not None and abs(near[0]-rc[0]) + abs(near[1]-rc[1]) <= 5:
+            refills.add(near)
+    station_set = set(detected_stations)
+
+    opp = {a: next((b for b in ACTS if DIR[b] == (-DIR[a][0], -DIR[a][1])), a) for a in ACTS}
+    def energy_at(path_to):
+        gg = copy.deepcopy(base); pc, col = P0, COL0
+        for a in path_to:
+            gg.perform_action(AIN[a]); mv = classify(render(gg), pc, col, a)
+            if mv: pc, col = mv
+        osc = [ACTS[0], opp[ACTS[0]]]
+        for step in range(1, 60):
+            gg.perform_action(AIN[osc[step % 2]]); grid = render(gg)
+            f = player_at(grid, pc, col, 7)
+            if f is None or abs(f[1][0]-pc[0]) + abs(f[1][1]-pc[1]) > 8:
+                z = player_at(grid, P0, COL0, 5)
+                if z and abs(z[1][0]-P0[0]) + abs(z[1][1]-P0[1]) <= 4:
+                    return step                      # died here -> energy was `step`
+            if f: pc, col = f[1], f[2]
+        return None
+    # EMAX = min over a few deep cells of (energy_there + steps_to_there) — a refill-free path gives EMAX
+    EMAX = 42
+    ests = []
+    for C in [c for c in cells if c not in refills][:4]:
+        e = energy_at(paths[C])
+        if e: ests.append(e + len(paths[C]))
+    if ests: EMAX = min(ests) - 1            # the oracle lags death detection by ~1 frame; be conservative
+    if verbose: print(f"L{level}: refills(dead-reckon)={sorted(refills)} EMAX={EMAX}")
+
+    import heapq
+    def eroute(src, dst, e_in, avoid):
+        """Min-step path src->dst keeping energy>0; refills reset energy to EMAX; never pass `avoid`
+        cells (other stations) so the carried config isn't perturbed. Returns (path, e_out) or None."""
+        pq = [(0, src, e_in, [])]; best = {(src, e_in): 0}
+        while pq:
+            steps, cell, e, path = heapq.heappop(pq)
+            if cell == dst: return path, e
+            if steps > best.get((cell, e), 1 << 30): continue
+            for a, nb in edges.get(cell, {}).items():
+                if nb != dst and nb in avoid: continue
+                if e < 1: continue
+                ne = e - 1
+                if ne == 0 and nb not in refills: continue        # would die
+                if nb in refills: ne = EMAX
+                k = (nb, ne)
+                if steps + 1 < best.get(k, 1 << 30):
+                    best[k] = steps + 1; heapq.heappush(pq, (steps + 1, nb, ne, path + [a]))
+        return None
+
+    def cyc_wps(C, k):
+        wps = [C]
+        if k > 1:
+            nbr = next((nb for a, nb in edges.get(C, {}).items()
+                        if nb != C and nb not in station_set and nb not in refills), None)
+            if nbr is None: return None
+            wps += [nbr, C] * (k - 1)
+        return wps
+    def nearest_refill(pos, e):
+        best = None
+        for rf in refills:
+            r = eroute(pos, rf, e, station_set)
+            if r and (best is None or len(r[0]) < len(best[1])):
+                best = (rf, r[0], r[1])
+        return best                              # (refill_cell, path, EMAX) or None
+    def realize(wps, deliver):
+        """Energy-aware action sequence visiting waypoints in order then delivering. Refuels
+        PROACTIVELY (Dijkstra minimises steps, so it would otherwise arrive drained and strand the
+        long final leg). Whenever energy is below half and a refill is reachable, top up first."""
+        e = EMAX; pos = start; full = []
+        for wp in wps:
+            if e < EMAX * 0.55 and refills:
+                tp = nearest_refill(pos, e)
+                if tp: _, pth, e = tp; full += pth; pos = tp[0]
+            r = eroute(pos, wp, e, station_set)
+            if r is None:                        # can't reach directly -> force a refill detour
+                tp = nearest_refill(pos, e)
+                if tp is None: return None
+                _, pth, e = tp; full += pth; pos = tp[0]
+                r = eroute(pos, wp, e, station_set)
+                if r is None: return None
+            p, e = r; full += p; pos = wp
+        return full + [deliver] if e >= 2 else None
     MAXK = 4
 
+    import os
+    if os.environ.get("SF_DEBUG_COMBO"):         # "c1x,c1y,k1,c2x,c2y,k2" -> diagnose this combo
+        vals = [int(v) for v in os.environ["SF_DEBUG_COMBO"].split(",")]
+        C1, k1, C2, k2 = (vals[0], vals[1]), vals[2], (vals[3], vals[4]), vals[5]
+        wps = (cyc_wps(C1, k1) or []) + (cyc_wps(C2, k2) or [])
+        print(f"  DEBUG combo C1{C1}x{k1} C2{C2}x{k2}; wps={wps}")
+        for fr in frontiers[:4]:
+            cell, a = fr
+            sol = realize(wps + [cell], a)
+            won_it = run_fast(sol) if sol else None
+            print(f"    frontier {ftgt(fr)}: sol_len={len(sol) if sol else None} won={won_it}")
+        return False, dict(level=level, debug=True)
+
+    # Search FRONTIER-OUTER, interleaving D=1 (one station) and D=2 (two stations) so the most
+    # promising (blue-marker-nearest) delivery cell gets both passes early. Station candidates are the
+    # DETECTED stations (small), which is why D=1 no longer drowns the search (the earlier bug: 65
+    # cells x 86 frontiers exhausted the budget before D=2 even started).
+    Cs = detected_stations or cells[:14]
+    res = None; status = "exhausted"
+    def combos_for(cell, a):
+        for C in Cs:                                   # D=1
+            for k in range(1, MAXK + 1):
+                w = cyc_wps(C, k)
+                if w is not None: yield (w + [cell], a, 1)
+        for C1 in Cs:                                  # D=2
+            for k1 in range(1, MAXK + 1):
+                w1 = cyc_wps(C1, k1)
+                if w1 is None: continue
+                for C2 in Cs:
+                    if C2 == C1: continue
+                    for k2 in range(1, MAXK + 1):
+                        w2 = cyc_wps(C2, k2)
+                        if w2 is not None: yield (w1 + w2 + [cell], a, 2)
+        for C1 in Cs:                                  # D=3 (e.g. L4: shape + colour + rotation)
+            for k1 in range(1, MAXK + 1):
+                w1 = cyc_wps(C1, k1)
+                if w1 is None: continue
+                for C2 in Cs:
+                    if C2 == C1: continue
+                    for k2 in range(1, MAXK + 1):
+                        w2 = cyc_wps(C2, k2)
+                        if w2 is None: continue
+                        for C3 in Cs:
+                            if C3 == C1 or C3 == C2: continue
+                            for k3 in range(1, MAXK + 1):
+                                w3 = cyc_wps(C3, k3)
+                                if w3 is not None: yield (w1 + w2 + w3 + [cell], a, 3)
     trials = 0
-    def try_combos(combo_iter, dval):
-        nonlocal trials
-        for build, (cell, a) in combo_iter:
+    for fr in frontiers:
+        if res is not None: break
+        cell, a = fr
+        for wps, da, dval in combos_for(cell, a):
             if trials >= trial_cap or time.time() - t0 > time_cap:
-                return ("capped", None)
-            pre = build()
-            if pre is None: continue
-            leg = bfs(pre[1], cell)
-            if leg is None: continue
-            sol = pre[0] + leg + [a]; trials += 1
+                status = "capped"; break
+            sol = realize(wps, da)
+            if sol is None: continue
+            trials += 1
             if run_fast(sol):
-                return ("won", (sol, pre[2], ftgt((cell, a)), dval))
-        return ("exhausted", None)
-
-    # D=1: one station cycled k times (L0: rotation k=1; L1: rotation k=3)
-    def one(C, k):
-        return lambda: ((cp, C, [(C, k)]) if (cp := cycle_path(C, k)) is not None else None)
-    g1 = ((one(C, k), fr) for fr in frontiers for C in cells for k in range(1, MAXK + 1))
-    status, res = try_combos(g1, 1)
-
-    # D=2: two stations, each cycled. Both L2 stations (colour + rotation) are detected, so search
-    # detected x detected FIRST (small); fall back to detected x all-cells for any undetected station.
-    def two(C1, k1, C2, k2):
-        def b():
-            cp = cycle_path(C1, k1)
-            if cp is None: return None
-            leg = bfs(C1, C2)
-            if leg is None: return None
-            cp = cp + leg
-            if k2 > 1:
-                ob = offback(C2)
-                if ob is None: return None
-                cp = cp + ob * (k2 - 1)
-            return (cp, C2, [(C1, k1), (C2, k2)])
-        return b
-    if status != "won":
-        c1set = detected_stations or cells[:12]
-        for c2set in ([detected_stations] if detected_stations else []) + [cells]:
-            g2 = ((two(c1, k1, c2, k2), fr) for fr in frontiers
-                  for c1 in c1set for k1 in range(1, MAXK + 1)
-                  for c2 in c2set for k2 in range(1, MAXK + 1) if c2 != c1)
-            status, res = try_combos(g2, 2)
-            if status == "won": break
+                res = (sol, ftgt(fr), dval); status = "won"; break
+        if status == "capped": break
 
     dt = time.time() - t0
     if res:
-        sol, passlist, slot_at, dval = res
+        sol, slot_at, dval = res
         if verbose:
             print(f"  ✅ SOLVED L{level} FROM PIXELS ONLY — {len(sol)} actions, {trials} trials, "
-                  f"D={dval}, {dt:.0f}s; stations {passlist}, slot @ {slot_at}")
+                  f"D={dval}, {dt:.0f}s; slot @ {slot_at}")
         return True, dict(level=level, actions=len(sol), trials=trials, D=dval, secs=round(dt, 1), sol=sol)
     if verbose:
         print(f"  ❌ L{level}: no winning combination ({trials} trials, {status}, {dt:.0f}s)")

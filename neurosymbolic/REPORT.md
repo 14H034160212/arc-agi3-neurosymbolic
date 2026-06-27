@@ -60,13 +60,15 @@ A **configuration-delivery puzzle**, *not* maze navigation:
 - The free-LLM induction reaches 3/7 (see `llm_induce.py`); stronger model/feedback closes the gap.
 - Energy/lives respawn is modeled enough to plan no-death solutions; full lives modeling is future work.
 
-## Source-free agent (`source_free_agent.py`) — ✅ solves L0 + L1 from pixels only (2/7)
-Solves `ls20` levels 0 **and** 1 **end-to-end from pixels + actions only**, *chained* (you reach L1
-only by winning L0 — `RESET` returns to L0, exactly as a real agent progresses). Every decision uses
-only the rendered grid + the environment's win/lose feedback; no engine internals are read for
-planning. With engine state the planner does 7/7 (`ls20_solver.py`); **2/7 is how far pixels-only
-currently reaches**, and L2's obstacle is precisely characterized (below). Insights that got here,
-after naive color-based perception failed:
+## Source-free agent (`source_free_agent.py`) — ✅ solves L0–L4 from pixels only (5/7)
+Solves `ls20` levels 0 **through 4** **end-to-end from pixels + actions only**, *chained* (you reach
+each level only by winning the previous — `RESET` returns to L0, exactly as a real agent progresses).
+Every decision uses only the rendered grid + the environment's win/lose feedback; no engine internals
+are read for planning. With engine state the planner does 7/7 (`ls20_solver.py`); **5/7 is how far
+pixels-only reaches** (L5 = two slots, L6 = last level — see below). The per-level difficulty climbs:
+L0 = 1 rotation cycle, L1 = 3 rotation cycles, L2 = colour + rotation, L3, L4 = shape + colour +
+rotation — each delivered through energy-budgeted routing. Insights that got here, after naive
+color-based perception failed:
 
 - **Color overloading defeats naive perception.** One render color plays several roles — color 4 =
   collision-walls *and* non-colliding void; color 5 = borders *and* the deliver cell; color 9 = the
@@ -104,31 +106,34 @@ Pipeline: learn dirs once → per level, checkpoint at start via prefix → expl
 graph by deterministic replay (dead-reckoned, color-agnostic) → search (station candidate × cycles ×
 blocked frontier), blue-marker-first, confirmed by the win signal.
 
-**L2: perception + logic solved; the only remaining blocker is energy.** It needs *two* stations
-(color 0→1 *and* rotation 0→3). Cracked along the way:
-- **Station detection.** The carried config is rendered in a **fixed HUD inventory panel** (a corner),
-  not on the player sprite. So a station is a cell whose *on-and-back* touch **persistently** changes
-  the far-from-body player-palette pixels (the HUD), compared **at the same position** so the
-  color-9-overloaded slot markers cancel. L2's color and rotation stations are both detected.
-- **Config logic** verified on the engine: color×1 + rotation×3 → exactly the slot's `(5,1,3)`.
-- **Energy is the wall — and it's a *hidden* variable.** The traversal (start → color → rotation → 3
-  cycles → slot) is ~68 steps, but energy starts at 42 and drains −1/step; the agent dies en route and
-  **death resets the carried config**, so it never delivers. Critically, **energy is not in the 64×64
-  render at all** (it drains 42→36 with *zero* pixel change) — a source-free agent cannot *read* it.
-  It can only **infer** it from the consequence: death teleports the player to start and resets the
-  config (both visible). So source-free L2 is a **hidden-state inference** problem: learn the budget
-  (EMAX — e.g. drive until a death/teleport) and the refill (`iri`) cells (a cell after which you can
-  travel > EMAX steps without dying), then plan energy-budgeted routes. This is qualitatively harder
-  than the fully-observable perception (position/stations/slots) already solved. Multi-slot levels (L5)
-  additionally need an intermediate-slot-solved detector.
+Two more mechanisms unlocked L2–L4:
 
-Reported honestly: **2/7 source-free end-to-end**; for L2 the *observable* perception and config
-reasoning are solved, and the remaining gap is inferring a hidden resource (energy) from death events.
-(With engine state the planner does 7/7.)
+- **Stations read from a fixed HUD panel.** The carried config is rendered in a **corner inventory**,
+  not on the player sprite. So a station = a cell whose *on-and-back* touch **persistently** changes
+  the far-from-body player-palette pixels (the HUD), compared **at the same position** so the
+  color-9-overloaded slot markers cancel. This finds the color/shape/rotation stations cleanly. The
+  search then tries D=1/2/3 station-cycle combinations (one/two/three attributes) and the **win signal
+  confirms** which delivers — L2 = color + rotation, L4 = shape + color + rotation.
+
+- **Energy is a *hidden* variable — inferred, not perceived.** Energy is **not in the 64×64 render at
+  all** (it drains with *zero* pixel change); a source-free agent cannot read it. We measure it with an
+  **oracle**: spam moves until the player dies and teleports back to start — the step count *is* the
+  energy (−1/step), giving EMAX. Refills (`iri`) *are* visible (a distinct **color-11** marker) and
+  reset energy to EMAX. Routing is then **energy-aware Dijkstra** over `(cell, energy)` with
+  **proactive refuelling** (min-steps alone arrives drained and strands the long final leg), avoiding
+  other stations so the carried config isn't perturbed. Death resets the config, so staying alive is
+  part of the plan. This cracked the ~68-step L2 route and the multi-station L3/L4.
+
+**Remaining (L5, L6):** L5 has **two slots** — a single delivery doesn't advance the level, so it needs
+an *intermediate-slot-solved detector* (a slot marker turning inert is visible). L6 is the last level
+(win = `GameState.WIN`). Reported honestly: **5/7 source-free end-to-end** (7/7 with engine state).
+The progression is itself the result: the agent self-discovers position, stations, slots, multi-step
+configuration, *and* a hidden resource — exactly the "infer the hidden rules from consequences" skill
+ARC-AGI-3 targets.
 
 ## Files
 - `ls20_solver.py` — model + planner + engine verification; `python ls20_solver.py` → solves 7/7.
 - `llm_induce.py` — local-LLM induction with plan-based APD refine loop.
 - `perception.py` — pixel→symbol structure extractor (camera static; recovers obstacle map/player/slot).
-- `source_free_agent.py` — pixels-only agent; **solves L0 + L1 (2/7), chained, from render + win feedback**.
+- `source_free_agent.py` — pixels-only agent; **solves L0–L4 (5/7), chained, from render + win feedback**.
 - `SLIDES_zh.md` — Chinese presentation outline.
