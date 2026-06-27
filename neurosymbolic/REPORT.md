@@ -60,10 +60,13 @@ A **configuration-delivery puzzle**, *not* maze navigation:
 - The free-LLM induction reaches 3/7 (see `llm_induce.py`); stronger model/feedback closes the gap.
 - Energy/lives respawn is modeled enough to plan no-death solutions; full lives modeling is future work.
 
-## Source-free agent (`source_free_agent.py`) — ✅ solves L0 from pixels only
-Solves `ls20` level 0 **end-to-end from pixels + actions only** (16 actions): every decision uses
+## Source-free agent (`source_free_agent.py`) — ✅ solves L0 + L1 from pixels only (2/7)
+Solves `ls20` levels 0 **and** 1 **end-to-end from pixels + actions only**, *chained* (you reach L1
+only by winning L0 — `RESET` returns to L0, exactly as a real agent progresses). Every decision uses
 only the rendered grid + the environment's win/lose feedback; no engine internals are read for
-planning. Three insights cracked it, after color-based perception failed:
+planning. With engine state the planner does 7/7 (`ls20_solver.py`); **2/7 is how far pixels-only
+currently reaches**, and L2's obstacle is precisely characterized (below). Insights that got here,
+after naive color-based perception failed:
 
 - **Color overloading defeats naive perception.** One render color plays several roles — color 4 =
   collision-walls *and* non-colliding void; color 5 = borders *and* the deliver cell; color 9 = the
@@ -80,13 +83,38 @@ planning. Three insights cracked it, after color-based perception failed:
   brute a pass-through "station candidate" over the reachable cells and retry each blocked frontier;
   the combination that **wins** (environment feedback) reveals both the station and the slot.
 
-Pipeline: learn action dirs → explore the freely-reachable graph by deterministic RESET+replay →
-brute (pass-through cell × blocked frontier), confirmed by the win signal. This closes the
-source-free loop the earlier prototype only characterised.
+Generalizing past L0 added four mechanisms, each forced by a real obstacle found by running it:
+- **Prefix-chaining.** `RESET` always returns to L0, so to work on level *k* every replay is
+  `RESET + (known winning solutions for L0…k-1) + path` (cached as a deepcopy checkpoint). Levels
+  chain by *winning*, never by jumping — `set_level` (engine-internal) is never used.
+- **Direction learning by elimination.** The four actions map bijectively to the four cardinals;
+  per-level probing mis-infers when a move is wall-blocked at that level's start (caused a
+  401-phantom-cell bug). Learn the map once where unobstructed; fill any single unknown by the one
+  missing cardinal.
+- **Color-agnostic, multi-part player tracking.** The player sprite is an orange **body** plus a
+  separate **carried-object sub-blob**; the body never recolors but the carried blob does (at a
+  color station). Track one part by color-continuity (prefer the last color; fall back only when it
+  vanishes) and classify move-vs-block by *which lattice point the centroid is nearer* — robust to
+  blob size, reshape, and recolor.
+- **Station cycling.** A station cycles its attribute once per entry; to cycle *k* times, enter,
+  then step off-and-back (k−1) times. L0 needs 1 rotation cycle, **L1 needs 3** — found by the win
+  oracle over (candidate cell × k).
+
+Pipeline: learn dirs once → per level, checkpoint at start via prefix → explore the freely-reachable
+graph by deterministic replay (dead-reckoned, color-agnostic) → search (station candidate × cycles ×
+blocked frontier), blue-marker-first, confirmed by the win signal.
+
+**L2 is the frontier.** It needs *two* stations (color 0→1 *and* rotation 0→3). Two obstacles remain:
+(a) the color change is in the carried sub-blob, and signature-based station detection is confounded
+because **color-9 is overloaded** (player palette *and* the slot marker), so a slot marker near the
+player looks like a station; (b) the two-station search is large and times out without clean station
+candidates. Next: disambiguate stations from slots (a station *persistently* changes the carried
+config; a slot *blocks*), then prune the search to the few real stations. Multi-slot levels (L5) also
+need an intermediate-slot-solved detector. This is reported honestly — 2/7 source-free, not a claim of 7.
 
 ## Files
 - `ls20_solver.py` — model + planner + engine verification; `python ls20_solver.py` → solves 7/7.
 - `llm_induce.py` — local-LLM induction with plan-based APD refine loop.
 - `perception.py` — pixel→symbol structure extractor (camera static; recovers obstacle map/player/slot).
-- `source_free_agent.py` — pixels-only agent; **solves L0 end-to-end from the render + win feedback**.
+- `source_free_agent.py` — pixels-only agent; **solves L0 + L1 (2/7), chained, from render + win feedback**.
 - `SLIDES_zh.md` — Chinese presentation outline.
