@@ -50,9 +50,14 @@ A **configuration-delivery puzzle**, *not* maze navigation:
 ## Honest limitations / what's next
 - The LLM induction is robust on level 0; **multi-level / energy / multi-slot induction by the
   free model is harder** (see `llm_induce.py` output) — stronger feedback or a stronger model helps.
-- **Goal/perception**: here the goal mechanic is induced from a win *observation*, and symbolic
-  state is read from the engine. Transfer to **unseen test games (no source)** needs a real
-  **pixel→symbol perception** module (`perception.py`, prototype) — the main open problem.
+- **Perception** (`perception.py`): ls20's **camera is static** (stays at (0,0)) → **screen coords ==
+  world coords**, so there is *no* camera-tracking problem. From pixels alone we recover a
+  planning-valid obstacle map (impassable = color 4, covering 103/107 collision sprites), the
+  player (orange, ~3px), and goal-slot markers (blue). What pixels do NOT give: a station's
+  *type* and the carried/required *configs* — those are **semantics learned by INTERACTION**
+  (press a station, watch what changes). Perception(structure) + interaction(semantics) + planner
+  = a source-free agent (the concrete next milestone).
+- The free-LLM induction reaches 3/7 (see `llm_induce.py`); stronger model/feedback closes the gap.
 - Energy/lives respawn is modeled enough to plan no-death solutions; full lives modeling is future work.
 
 ## Files
