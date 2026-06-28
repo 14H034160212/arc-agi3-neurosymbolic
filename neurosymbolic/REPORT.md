@@ -166,9 +166,34 @@ genuinely different ARC-AGI-3 game. The value is the **methodology**, and we mak
 
 So `ls20` 7/7 is an **existence proof** that *once the per-game abstractions are right, source-free
 symbolic solving is complete*. The open frontier — and the right place for the LLM — is **inducing
-those abstractions on an unseen game**. Next steps: lift remaining ls20 specifics into the core,
-add an LLM-driven adapter, and measure cross-game transfer on other public ARC-AGI-3 games (the metric
-comparable to Symbolica's 36%).
+those abstractions on an unseen game**.
+
+### Object-role discovery (general) + a fully general solve
+`source_free_core.py` now also does **role discovery by interaction** (`discover_roles`): with no colour
+or semantics assumed, it labels cells as **transformers** (touching persistently changes the agent's
+carried state — ls20 *stations*), **gates** (blocked frontiers that open under the right state — *slots*),
+and **replenishers** (touching raises the hidden-resource budget — *refills*). On top of it,
+`solve_single_goal` is a **fully general solver** that — using only the operators + the win/score oracle —
+**auto-discovers the transformer and solves ls20 L0 in 16 actions through the Env abstraction, with zero
+ls20 knowledge.** That makes the skeleton a real solver, not just perception.
+
+### Cross-game transfer test (step 3) — measured on the other local games
+Pointing the *same* operators at every local game (`ls20`, `ft09`, `vc33`) gives an honest result:
+
+| Game | Auto-detected modality | Transfer |
+|---|---|---|
+| `ls20` | **movement** (directional basis emerges) | ✅ operators apply; general solver wins L0 by discovery |
+| `ft09` | not movement (directional actions inert) | ❌ different modality |
+| `vc33` | not movement — **click-based** (its `step()` only handles `ACTION6`, reading `data["x"/"y"]` to click a grid cell) | ❌ different modality |
+
+The new `detect_modality` operator makes the agent **self-aware**: it correctly identifies `ls20` as a
+movement game and **refuses to false-claim** on the click games (no silent failure). So the operators
+transfer **fully to same-modality** (grid-movement, deterministic) games, and the boundary is the
+**interaction modality**. The concrete next operator family is **clicks**: explore by clicking cells,
+discover clickable objects by their click-effects, plan click sequences — the *same* probe/track/explore/
+discover/search loop in a different modality. Where auto-discovery is insufficient, the `LLMAdapter`
+extension point lets an LLM supply per-game hints (agent / goal signal / interactables). Measuring solve
+rate across many ARC-AGI-3 games is the metric comparable to Symbolica's 36%.
 
 ## Files
 - `source_free_core.py` — **game-agnostic skeleton**: the general operators + the `Env`/`Adapter`

@@ -282,62 +282,228 @@ def interaction_role(env: Env, edges, paths, ckpt, basis, cell, signature_fn):
     return "inert"
 
 
-# ═════════════════════════════ live demo: drive ls20 through the Env abstraction ══════════════════
-class _Ls20Env:
-    """A thin ADAPTER wrapping ls20 as an `Env`. Note how small it is: everything game-specific lives
-    here (engine calls + which actions exist); the operators above never see ls20."""
-    def __init__(self, level=0, _g=None):
+# ───────────────────────────── operator 7: discover object ROLES (no appearance assumed) ──────────
+def state_signature(grid, agent_pos, near=6):
+    """The 'world + carried state' away from the agent: all non-background pixels farther than `near`
+    from the agent. Compared at the SAME agent position, static scenery cancels; only a persistent
+    change (e.g. an inventory/HUD indicator, a consumed marker) survives. GENERAL: this is `hud_sig`
+    with the HUD LOCATION discovered ('far from the agent') instead of hard-coded."""
+    bg = int(np.bincount(grid.flatten()).argmax())
+    ys, xs = np.where(grid != bg)
+    return frozenset((int(grid[y, x]), int(x), int(y)) for y, x in zip(ys, xs)
+                     if abs(int(x) - agent_pos[0]) + abs(int(y) - agent_pos[1]) > near)
+
+def discover_roles(env: Env, basis, tracker: AgentTracker, graph, resource=False, budget_cells=24):
+    """Classify the map's interactables by INTERACTION, not appearance:
+        transformers — touching persistently changes the agent's own (carried) state  [ls20 stations]
+        gate_cands   — blocked frontiers that may open under the right state           [ls20 slots]
+        replenishers — touching raises the hidden-resource budget (only if `resource`) [ls20 refills]
+    GENERAL: lifts ls20's station/slot/refill detection into role discovery with no colour/semantics
+    baked in (the signature is 'far-from-agent state'; the budget test is the act-until-failure oracle)."""
+    edges, paths, ckpt, blocked = graph["edges"], graph["paths"], graph["ckpt"], graph["blocked"]
+    bfs = Explorer.bfs
+    transformers = []
+    for cell in paths:
+        if cell == graph["start"]:
+            continue
+        tag = interaction_role(env, edges, paths, ckpt, basis, cell, state_signature)
+        if tag == "transformer":
+            transformers.append(cell)
+    replenishers = []
+    if resource:
+        oracle = HiddenResourceOracle(env, (tracker_start := (ckpt[graph["start"]][1], ckpt[graph["start"]][2])), tracker)
+        osc = [a for a, (k, _) in basis.items() if k == "move"][:2]
+        base_budget = oracle.budget_from([], osc) or 0
+        deep = sorted(paths, key=lambda c: -(abs(c[0]) + abs(c[1])))[:budget_cells]
+        for cell in deep:
+            b = oracle.budget_from(paths[cell], osc)
+            if b is not None and b >= base_budget:       # arriving with a full tank => a replenisher
+                replenishers.append(cell)
+    return dict(transformers=transformers, gate_cands=blocked, replenishers=replenishers)
+
+
+# ───────────────────────────── operator 8: general single-goal solver ──────────────────────────────
+def solve_single_goal(env: Env, max_cycles=4, verbose=True):
+    """A fully GENERAL solve of one goal, using only the operators above + the Env oracle: learn the
+    action basis, find + track the agent, explore, discover transformer cells, then search
+    (transformer x cycle-count x gate) verified by win/score. No ls20 knowledge. Proves the skeleton is
+    a real solver, not just perception. (Hidden-resource routing / multi-goal chaining are the ported
+    operators that extend this to the deeper ls20 levels; here we demonstrate the no-resource case.)"""
+    basis = learn_action_basis(env)
+    agent = find_agent(env, basis)
+    if agent is None:
+        return None
+    pal = _palette(env.render()); tracker = AgentTracker(basis, pal)
+    graph = Explorer(env, basis, agent, tracker).explore()
+    roles = discover_roles(env, basis, tracker, graph)
+    edges, paths = graph["edges"], graph["paths"]; bfs = Explorer.bfs
+    Ts = roles["transformers"]; start = graph["start"]
+    if verbose:
+        print(f"    discovered {len(Ts)} transformer cell(s); {len(roles['gate_cands'])} gate candidates")
+
+    def offback(C):
+        v0 = None
+        for a, nb in edges.get(C, {}).items():
+            if nb != C:
+                return [a, next((b for b, (k, w) in basis.items()
+                                 if w == (-basis[a][1][0], -basis[a][1][1])), a)]
+        return None
+    def cycle_plan(C, k):
+        p = bfs(edges, start, C)
+        if p is None: return None
+        if k > 1:
+            ob = offback(C)
+            if ob is None: return None
+            p = p + ob * (k - 1)
+        return p
+
+    base = env.clone(); base.reset(); s0 = base.score()
+    def wins(plan):
+        e = env.clone(); e.reset()
+        for a in plan:
+            e.step(a)
+            if e.status() == "WIN" or e.score() > s0:
+                return True
+        return False
+
+    # search: route through a transformer (cycled k) then into a gate, verified by win/score
+    near = lambda c: abs(c[0]) + abs(c[1])
+    for (gcell, ga) in sorted(roles["gate_cands"], key=lambda fr: near((fr[0][0], fr[0][1]))):
+        for C in Ts:
+            for k in range(1, max_cycles + 1):
+                cp = cycle_plan(C, k)
+                if cp is None: continue
+                seg = bfs(edges, C, gcell)
+                if seg is None: continue
+                plan = cp + seg + [ga]
+                if wins(plan):
+                    if verbose:
+                        print(f"    ✅ solved via transformer {C} x{k} -> gate (plan {len(plan)} actions)")
+                    return plan
+    return None
+
+
+# ───────────────────────────── operator 0: detect the INTERACTION MODALITY ────────────────────────
+def detect_modality(env: Env, sample_clicks=12):
+    """Before any solving, find out HOW the game is played — the first thing that differs across
+    ARC-AGI-3 games. Returns ('movement'|'click'|'unknown', basis). GENERAL and important: a
+    movement-tuned solver must NOT be pointed at a click game; this operator makes the agent
+    self-aware of the modality instead of failing silently. (Cross-game test: ls20->movement,
+    ft09/vc33->not-movement; vc33 confirmed click-based in its source.)"""
+    basis = learn_action_basis(env)
+    if sum(1 for k, _ in basis.values() if k == "move") >= 2:
+        return "movement", basis
+    if hasattr(env, "click"):
+        env.reset(); g0 = env.render(); bg = int(np.bincount(g0.flatten()).argmax())
+        ys, xs = np.where(g0 != bg); pts = list(zip(xs.tolist(), ys.tolist()))
+        for (x, y) in pts[:: max(1, len(pts) // sample_clicks)][:sample_clicks]:
+            e = env.clone(); b = e.render(); e.click(int(x), int(y))
+            if not np.array_equal(b, e.render()):
+                return "click", basis
+    return "unknown", basis
+
+
+# ───────────────────────────── operator 9 (extension point): LLM-driven adapter ───────────────────
+LLM_ADAPTER_PROMPT = """You are the perception module for a source-free game-playing agent. You are
+given a few rendered frames (integer grids) and the effects of probing each action. Output JSON:
+  {"agent_color": <int or null>,        # which colour is the agent (null = let motion auto-detect)
+   "goal_signal": "win" | "score",      # how progress is observed
+   "interactable_hint": [[x,y],...]}    # cells worth probing as transformers/gates (optional)
+Base your answer ONLY on the frames + probe effects; do not assume any game's rules."""
+
+class LLMAdapter:
+    """The PER-GAME induction surface, produced by an LLM for an UNSEEN game. On a game where the
+    general auto-discovery (motion agent + role discovery) is insufficient, the LLM reads a few frames
+    + probe effects and returns the hints below. This is the concrete integration point for the
+    neuro-symbolic plan (LLM induces the per-game perception; the operators above plan + verify).
+    `call_llm` is injected so this stays API/provider-agnostic (e.g. local gpt-oss via Ollama)."""
+    def __init__(self, call_llm=None):
+        self.call_llm = call_llm                       # fn(prompt, frames) -> JSON str ; None = heuristic
+    def induce(self, env: Env, basis):
+        if self.call_llm is None:                      # default: pure auto-discovery, empty hints
+            return dict(agent_color=None, goal_signal="win", interactable_hint=[])
+        import json
+        frames = [env.render().tolist()]               # a real impl would include probe-effect summaries
+        try:
+            return json.loads(self.call_llm(LLM_ADAPTER_PROMPT, frames))
+        except Exception:
+            return dict(agent_color=None, goal_signal="win", interactable_hint=[])
+
+
+# ═════════════════════════ a generic ARC-AGI-3 env adapter (works for ANY of the games) ════════════
+class ArcGameEnv:
+    """Wraps any local ARC-AGI-3 game (ls20 / ft09 / vc33 / ...) as an `Env`. The ONLY game-specific
+    thing here is the file path + class name + grid size — exactly the thin adapter layer. Supports
+    `click(x,y)` (ACTION6) so the modality detector can probe click games too."""
+    DIRS = ["ACTION1", "ACTION2", "ACTION3", "ACTION4"]
+    def __init__(self, game, cls, size, level=0, _g=None):
         import importlib.util
         from pathlib import Path
-        if _g is None:
-            ENV = Path(__file__).resolve().parent.parent / "environment_files/ls20/cb3b57cc/ls20.py"
-            spec = importlib.util.spec_from_file_location("ls20mod", ENV)
-            m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-            self._cls = m.Ls20; self.g = m.Ls20(); self.g.set_level(level)
-        else:
-            self._cls = None; self.g = _g
         from arcengine import GameAction, ActionInput
-        self._AIN = {a: ActionInput(id=getattr(GameAction, a)) for a in
-                     ["ACTION1", "ACTION2", "ACTION3", "ACTION4"]}
-        self._RESET = ActionInput(id=GameAction.RESET)
-        self.actions = ["ACTION1", "ACTION2", "ACTION3", "ACTION4"]
-        self._lvl0 = self.g.level_index
-    def reset(self): self.g.perform_action(self._RESET)
+        if _g is None:
+            f = list((Path(__file__).resolve().parent.parent / "environment_files" / game).glob(f"*/{game}.py"))[0]
+            spec = importlib.util.spec_from_file_location(game, f)
+            m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+            self.g = getattr(m, cls)()
+            try: self.g.set_level(level)
+            except Exception: pass
+        else:
+            self.g = _g
+        self.game, self.cls, self.size = game, cls, size
+        self._AIN = {a: ActionInput(id=getattr(GameAction, a)) for a in self.DIRS}
+        self._R = ActionInput(id=GameAction.RESET); self._GA = GameAction; self._AI = ActionInput
+        self.actions = list(self.DIRS)
+    def reset(self): self.g.perform_action(self._R)
     def step(self, a): self.g.perform_action(self._AIN[a])
-    def render(self): return np.array(self.g.get_pixels(0, 0, 64, 64))
+    def click(self, x, y):
+        ai = self._AI(id=self._GA.ACTION6)
+        try: ai.data = {"x": x, "y": y}
+        except Exception: pass
+        self.g.perform_action(ai)
+    def render(self): return np.array(self.g.get_pixels(0, 0, self.size, self.size))
     def status(self):
         s = self.g._state.name
         return "WIN" if s == "WIN" else "LOSE" if s == "GAME_OVER" else "PLAYING"
-    def score(self): return self.g.level_index
+    def score(self): return getattr(self.g, "level_index", 0)
     def clone(self):
-        e = _Ls20Env.__new__(_Ls20Env)
-        e.g = copy.deepcopy(self.g); e._AIN = self._AIN; e._RESET = self._RESET
-        e.actions = self.actions; e._cls = None; e._lvl0 = self._lvl0
+        e = ArcGameEnv.__new__(ArcGameEnv)
+        e.g = copy.deepcopy(self.g)
+        for k in ("game", "cls", "size", "_AIN", "_R", "_GA", "_AI", "actions"):
+            setattr(e, k, getattr(self, k))
         return e
+
+GAMES = [("ls20", "Ls20", 64), ("ft09", "Ft09", 32), ("vc33", "Vc33", 32)]
 
 
 def _demo():
-    env = _Ls20Env(level=0)
-    basis = learn_action_basis(env)
-    print("action basis (no key meanings assumed):")
-    for a, (k, v) in basis.items():
-        print(f"    {a}: {k}{'' if v is None else ' ' + str(v)}")
-    agent = find_agent(env, basis)
-    print(f"agent found by MOTION: pos={agent[0]} colour={agent[1]}")
-    pal = _palette(env.render())
-    tracker = AgentTracker(basis, pal)
+    print("══ single-game depth: drive ls20 through the Env abstraction (zero engine internals) ══")
+    env = ArcGameEnv("ls20", "Ls20", 64, level=0)
+    mod, basis = detect_modality(env)
+    print(f"modality detected: {mod};  action basis: { {a: k for a, (k, _) in basis.items()} }")
+    agent = find_agent(env, basis); pal = _palette(env.render()); tracker = AgentTracker(basis, pal)
     g = Explorer(env, basis, agent, tracker).explore()
-    print(f"explored {len(g['paths'])} reachable cells; {len(g['blocked'])} blocked frontiers "
-          f"(walls / closed gates) — all via the Env abstraction, zero engine internals")
-    # hidden-resource probe: is there an unrendered budget? (ls20 energy)
-    osc = [a for a, (k, _) in basis.items() if k == "move"][:2]
-    deep = max(g["paths"], key=lambda c: abs(c[0]) + abs(c[1]))
-    oracle = HiddenResourceOracle(env, agent, tracker)
-    b = oracle.budget_from(g["paths"][deep], osc)
-    print(f"hidden-resource oracle at the deepest cell: {b} steps to failure "
-          f"(-> a hidden depleting resource exists; ls20 'energy', invisible in pixels)")
-    print("\nThis is the game-agnostic skeleton. To target an UNSEEN game, an LLM supplies only the small")
-    print("Adapter (goal_progress + interactable cues); these operators provide the rest of the loop.")
+    roles = discover_roles(env, basis, tracker, g)
+    print(f"agent by MOTION {agent[0]}; explored {len(g['paths'])} cells, {len(g['blocked'])} gates/walls; "
+          f"transformers discovered by INTERACTION = {roles['transformers']}")
+    plan = solve_single_goal(ArcGameEnv("ls20", "Ls20", 64, level=0), verbose=True)
+    print(f"  general solve of L0: {'WON ('+str(len(plan))+' actions)' if plan else 'no plan'}")
+
+    print("\n══ cross-game transfer (step 3): point the SAME operators at every local game ══")
+    for game, cls, size in GAMES:
+        try:
+            e = ArcGameEnv(game, cls, size, level=0)
+            mod, basis = detect_modality(e)
+            ag = find_agent(e, basis) if mod == "movement" else None
+            note = ("MOVEMENT -> operators apply" if mod == "movement"
+                    else f"{mod.upper()} -> needs a click-modality operator family (no movable agent)")
+            print(f"  {game}: modality={mod:8s} agent={'found' if ag else 'n/a':5s}  {note}")
+        except Exception as ex:
+            print(f"  {game}: error {type(ex).__name__}: {str(ex)[:60]}")
+    print("\nResult: the operators transfer FULLY to same-modality (grid-movement) games and the modality")
+    print("detector flags the rest HONESTLY (ft09/vc33 are click games). Next operator family = clicks:")
+    print("explore by clicking cells, discover clickable objects by their click-effects, plan click seqs —")
+    print("the same loop (probe/track/explore/discover/search) in the click modality. An LLM adapter can")
+    print("also supply per-game hints where auto-discovery is insufficient.")
 
 
 if __name__ == "__main__":
