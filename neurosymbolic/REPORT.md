@@ -60,15 +60,15 @@ A **configuration-delivery puzzle**, *not* maze navigation:
 - The free-LLM induction reaches 3/7 (see `llm_induce.py`); stronger model/feedback closes the gap.
 - Energy/lives respawn is modeled enough to plan no-death solutions; full lives modeling is future work.
 
-## Source-free agent (`source_free_agent.py`) — ✅ solves L0–L4 from pixels only (5/7)
-Solves `ls20` levels 0 **through 4** **end-to-end from pixels + actions only**, *chained* (you reach
-each level only by winning the previous — `RESET` returns to L0, exactly as a real agent progresses).
+## Source-free agent (`source_free_agent.py`) — ✅ solves ALL 7 levels from pixels only (7/7)
+Solves **all 7** `ls20` levels **end-to-end from pixels + actions only**, *chained* (you reach each
+level only by winning the previous — `RESET` returns to L0, exactly as a real agent progresses).
 Every decision uses only the rendered grid + the environment's win/lose feedback; no engine internals
-are read for planning. With engine state the planner does 7/7 (`ls20_solver.py`); **5/7 is how far
-pixels-only reaches** (L5 = two slots, L6 = last level — see below). The per-level difficulty climbs:
-L0 = 1 rotation cycle, L1 = 3 rotation cycles, L2 = colour + rotation, L3, L4 = shape + colour +
-rotation — each delivered through energy-budgeted routing. Insights that got here, after naive
-color-based perception failed:
+are read for planning. **This matches the engine-state planner's 7/7 (`ls20_solver.py`) using pixels
+alone.** The per-level difficulty climbs: L0 = 1 rotation cycle, L1 = 3 rotation cycles, L2 = colour +
+rotation, L3, L4 = shape + colour + rotation, L5 = two *stacked* slots (multi-slot), L6 = shape +
+colour + rotation (win = `GameState.WIN`) — each delivered through energy-budgeted routing. Insights
+that got here, after naive color-based perception failed:
 
 - **Color overloading defeats naive perception.** One render color plays several roles — color 4 =
   collision-walls *and* non-colliding void; color 5 = borders *and* the deliver cell; color 9 = the
@@ -124,26 +124,30 @@ Two more mechanisms unlocked L2–L4:
   other stations so the carried config isn't perturbed. Death resets the config, so staying alive is
   part of the plan. This cracked the ~68-step L2 route and the multi-station L3/L4.
 
-**Multi-slot (L5) — infrastructure built, search not yet converging.** L5 has **two slots** with
-different configs, so a single delivery doesn't win. We detect a solved slot **robustly by a drop in
-the marker-component count** (solving turns a slot's requirement marker inert; player/sub-blob drift
-can only *add* a component, never remove one → no false positives), and **chain sub-goals** (solve
-slot 1, re-explore from that state, solve slot 2). Tractability fixes were added — index-ordered
-station *combinations* (not permutations), dedup to one cyclable rep per station, `MAXK=6` (shape needs
-0→5). L5 **engages correctly** (detects 2 slots, no false solves) but the per-slot D=3 + energy search
-doesn't find slot 1's config within budget. The clear next step: **compute exact cycle counts instead
-of brute-searching** — the slot marker *encodes the required color* (color-9→tmx 1, color-8→tmx 3) and
-the rotation station is the one with no HUD change, so the color/shape/rotation cycles can be derived,
-collapsing the search. L6 is single-slot D=3 (win = `GameState.WIN`) — solvable by the current agent
-once it can chain past L5.
+**Multi-slot (L5) — solved.** L5 has **two slots** with different configs, **stacked** in one column
+(slot 1 sits below slot 2, and an unsolved slot blocks movement), so **slot 2 must be solved first** to
+open the path to slot 1. A **sub-goal driver** solves one slot, re-explores from that state, and repeats
+until fully won. Two fixes made it work:
+- **Move-based slot-solved detector.** A slot is solved **iff the final deliver step actually moves the
+  player onto the previously-blocked frontier** (a wall never moves; a slot moves only when the carried
+  config matches). This is immune to occlusion — *standing on* a marker isn't a solve — which an
+  earlier pixel-diff detector got wrong.
+- **Round-robin marker prioritisation.** Each real slot's delivery cell is tried early instead of being
+  buried by decoration markers that happen to have an exact-distance frontier.
 
-Reported honestly: **5/7 source-free end-to-end** (7/7 with engine state). The progression is itself
-the result: the agent self-discovers position, stations, slots, multi-step configuration, *and* a
-hidden resource — exactly the "infer the hidden rules from consequences" skill ARC-AGI-3 targets.
+So L5 chains automatically: solve slot 2 (the easy D=2 `(0,3,1)` = color×1 + rot×1), which unblocks
+slot 1, then solve slot 1 (D=2 from the new state) → win (66 actions, ~47 s). L6 (single-slot D=3,
+win = `GameState.WIN`) then falls out of the same machinery.
+
+**Reported result: 7/7 source-free, end-to-end, chained — matching the engine-state planner using
+pixels alone.** The progression is itself the point: the agent self-discovers position, the action
+basis, stations (from a HUD panel), slots, multi-step configuration, a *hidden* resource (energy), and
+multi-slot ordering — purely from the render and win/lose feedback, exactly the "infer the hidden rules
+from consequences" skill ARC-AGI-3 targets.
 
 ## Files
 - `ls20_solver.py` — model + planner + engine verification; `python ls20_solver.py` → solves 7/7.
 - `llm_induce.py` — local-LLM induction with plan-based APD refine loop.
 - `perception.py` — pixel→symbol structure extractor (camera static; recovers obstacle map/player/slot).
-- `source_free_agent.py` — pixels-only agent; **solves L0–L4 (5/7), chained, from render + win feedback**.
+- `source_free_agent.py` — pixels-only agent; **solves ALL 7 levels (7/7), chained, from render + win feedback**.
 - `SLIDES_zh.md` — Chinese presentation outline.

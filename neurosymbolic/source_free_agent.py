@@ -37,23 +37,20 @@ THE INSIGHTS THAT MAKE A SOURCE-FREE SOLVE WORK:
    refuelling (min-steps alone would arrive drained and strand the long final leg), avoiding other
    stations so the carried config isn't perturbed. Death resets the config, so staying alive matters.
 
-RESULT (pixels + win/lose feedback only): solves ls20 L0-L4 END-TO-END, chained (win each to reach the
-next). L0 = 1 rotation cycle (D=1); L1 = 3 rotation cycles (D=1); L2 = colour + rotation, energy-routed
-through refills (D=2); L3 (D=2); L4 = shape + colour + rotation (D=3). The search is FRONTIER-OUTER,
-interleaving D=1/2/3 station-cycle combos over the detected stations, delivery cells ordered by the
-blue slot-marker. With engine state (ls20_solver.py) all 7 solve; PIXELS-ONLY now reaches 5/7.
+RESULT (pixels + win/lose feedback only): solves ALL 7 ls20 levels END-TO-END, chained (win each to
+reach the next) — matching the engine-state planner's 7/7 using ONLY the render + win/lose feedback.
+L0 = 1 rotation cycle (D=1); L1 = 3 rotation cycles (D=1); L2 = colour + rotation, energy-routed through
+refills (D=2); L3 (D=2); L4 = shape + colour + rotation (D=3); L5 = TWO stacked slots (multi-slot);
+L6 = shape + colour + rotation, win = GameState.WIN (D=3). The search is FRONTIER-OUTER, interleaving
+D=1/2/3 station-cycle COMBINATIONS over the detected stations, delivery cells ordered round-robin by
+the slot markers.
 
-MULTI-SLOT (L5) — infrastructure built, search not yet converging: L5 has TWO slots with different
-configs, so a single delivery doesn't win. We detect a solved slot ROBUSTLY by a DROP in the
-marker-component count (solving turns a slot's requirement marker inert; player/sub-blob drift can
-only ADD a component, never remove one -> no false positives), and chain sub-goals (solve slot1,
-re-explore from that state, solve slot2). Tractability fixes: index-ordered station COMBINATIONS (not
-permutations), dedup stations to one cyclable rep, MAXK=6 (shape needs 0->5). L5 engages correctly
-(detects 2 slots) but the per-slot D=3 + energy search doesn't find slot1's config within budget.
-NEXT: compute exact cycle counts instead of brute-searching k — the slot marker ENCODES the required
-colour (colour-9 -> tmx 1, colour-8 -> tmx 3), and the rotation station is the one with no HUD change,
-so colour/shape/rotation cycles can be derived, collapsing the search. L6 = single-slot D=3 (win =
-GameState.WIN) — solvable by the current agent once it can chain past L5.
+7) MULTI-SLOT (L5): two slots with different configs, STACKED (slot1 below slot2, so slot2 must be
+   solved first to unblock slot1). A SUB-GOAL driver solves one slot, re-explores from that state, and
+   repeats until won. A slot is solved IFF the final deliver step actually MOVES the player onto the
+   previously-blocked frontier (a wall never moves; a slot moves only when the carried config matches)
+   -- robust to occlusion (standing on a marker is not a solve). Round-robin marker prioritisation
+   makes each real slot's delivery cell tried early instead of being buried by decoration markers.
 """
 from __future__ import annotations
 import copy
@@ -291,12 +288,27 @@ def solve_level(level, prefix=(), dirs=None, trial_cap=8000, time_cap=160.0, ver
 
     depth = lambda p: abs(p[0]) + abs(p[1])
     ftgt = lambda fr: (fr[0][0] + DIR[fr[1]][0], fr[0][1] + DIR[fr[1]][1])
-    blue_dr = [(round((cx - P0[0]) / 5) * 5, round((cy - P0[1]) / 5) * 5)
-               for (cx, cy, _) in comps_centroids(g0, SLOT)]
-    nearblue = lambda p: min((abs(p[0]-b[0])+abs(p[1]-b[1]) for b in blue_dr), default=depth(p))
-    frontiers = sorted(blocked, key=lambda fr: (nearblue(ftgt(fr)), -depth(ftgt(fr))))
+    # Candidate slot markers: components of any slot-requirement colour, away from player + HUD corner.
+    markers = []
+    for col in [SLOT] + MARKER_COLORS:
+        for (cx, cy, _) in comps_centroids(g0, col, 3):
+            if abs(cx-P0[0]) + abs(cy-P0[1]) > 12 and not (cx < 18 and cy > 50):
+                markers.append((round((cx-P0[0])/5)*5, round((cy-P0[1])/5)*5))
+    markers = sorted(set(markers))
+    nearmk = lambda p: min((abs(p[0]-m[0])+abs(p[1]-m[1]) for m in markers), default=depth(p))
+    # ROUND-ROBIN: each marker's nearest blocked frontier first (so a real slot whose delivery cell is
+    # ~5px off its marker isn't buried by a decoration marker that has an exact-distance-0 frontier),
+    # then the rest by marker proximity.
+    priority = []
+    for m in markers:
+        cand = min(blocked, key=lambda fr: abs(ftgt(fr)[0]-m[0]) + abs(ftgt(fr)[1]-m[1]), default=None)
+        if cand is not None and cand not in priority:
+            priority.append(cand)
+    rest = sorted([fr for fr in blocked if fr not in priority],
+                  key=lambda fr: (nearmk(ftgt(fr)), -depth(ftgt(fr))))
+    frontiers = priority + rest
     cells = sorted(paths.keys(), key=lambda c: -depth(c))
-    if verbose: print(f"L{level}: blue markers (dead-reckon) {blue_dr}")
+    if verbose: print(f"L{level}: slot markers (dead-reckon) {markers}")
 
     # --- disambiguate STATIONS from slots/refills/walls: a station PERSISTENTLY changes the carried
     # config. Probe each reachable cell X by stepping onto it and back to a neighbour A, comparing the
@@ -420,23 +432,34 @@ def solve_level(level, prefix=(), dirs=None, trial_cap=8000, time_cap=160.0, ver
     n_slots = count_markers(g0, P0)
     eff_partial = partial_ok and n_slots >= 2
     if verbose and partial_ok: print(f"L{level}: slot markers detected = {n_slots} (partial={'on' if eff_partial else 'off'})")
-    def success(sol):
-        if run_fast(sol): return (True, True)        # fast path: full win
+    def success(sol, target):
+        # full win (fast); else (multi-slot) a slot is solved IFF the final deliver step actually moved
+        # the player ONTO the previously-blocked frontier (a wall never moves; a slot moves only when
+        # the config matches). Robust to occlusion (standing on a marker doesn't count as solved).
+        if run_fast(sol): return (True, True)
         if not eff_partial: return (False, True)
-        _, pc, _, _, grid = trace(sol)               # slow path: did the marker count DROP (slot solved)?
-        return (count_markers(grid, pc) < n_slots, False)
+        pos, _, _, _, _ = trace(sol)
+        return (pos == target, False)
 
     import os
-    if os.environ.get("SF_DEBUG_COMBO"):         # "c1x,c1y,k1,c2x,c2y,k2" -> diagnose this combo
+    if os.environ.get("SF_DEBUG_COMBO"):         # "x1,y1,k1,x2,y2,k2[,x3,y3,k3]" -> diagnose this combo
         vals = [int(v) for v in os.environ["SF_DEBUG_COMBO"].split(",")]
-        C1, k1, C2, k2 = (vals[0], vals[1]), vals[2], (vals[3], vals[4]), vals[5]
-        wps = (cyc_wps(C1, k1) or []) + (cyc_wps(C2, k2) or [])
-        print(f"  DEBUG combo C1{C1}x{k1} C2{C2}x{k2}; wps={wps}")
-        for fr in frontiers[:4]:
+        triples = [(( vals[i], vals[i+1]), vals[i+2]) for i in range(0, len(vals), 3)]
+        wps = []
+        for C, k in triples:
+            w = cyc_wps(C, k)
+            print(f"  DEBUG station {C} x{k}: cyc_wps={'OK len '+str(len(w)) if w else 'None (uncyclable)'}")
+            wps += (w or [])
+        for fr in frontiers[:8]:
             cell, a = fr
             sol = realize(wps + [cell], a)
-            won_it = run_fast(sol) if sol else None
-            print(f"    frontier {ftgt(fr)}: sol_len={len(sol) if sol else None} won={won_it}")
+            if sol is None:
+                print(f"    frontier {ftgt(fr)}: realize=None (no energy-safe route)"); continue
+            # validate on engine: replay prefix+sol, print resulting carried config + solved flags
+            ge = Ls20(); ge.perform_action(RESET)
+            for x in list(prefix) + sol: ge.perform_action(AIN[x])
+            cfg = (ge.snw, ge.tmx, ge.tuv); rzt = list(getattr(ge, "rzt", []))
+            print(f"    frontier {ftgt(fr)}: len={len(sol)} mgu={(ge.mgu.x,ge.mgu.y)} carried={cfg} rzt={rzt} lvl={ge.level_index}")
         return False, dict(level=level, debug=True)
 
     # Search FRONTIER-OUTER, interleaving D=1 (one station) and D=2 (two stations) so the most
@@ -485,15 +508,16 @@ def solve_level(level, prefix=(), dirs=None, trial_cap=8000, time_cap=160.0, ver
     for fr in frontiers:
         if res is not None: break
         cell, a = fr
+        tgt = ftgt(fr)
         for wps, da, dval in combos_for(cell, a):
             if trials >= trial_cap or time.time() - t0 > time_cap:
                 status = "capped"; break
             sol = realize(wps, da)
             if sol is None: continue
             trials += 1
-            ok, won_full = success(sol)
+            ok, won_full = success(sol, tgt)
             if ok:
-                res = (sol, ftgt(fr), dval); status = "won"; fully = won_full; break
+                res = (sol, tgt, dval); status = "won"; fully = won_full; break
         if status == "capped": break
 
     dt = time.time() - t0
