@@ -443,6 +443,11 @@ def solve_click(env: Env, objs=None, scale=None, base=None, max_depth=3, node_ca
             print(f"    click modality: scale={scale}, {len(objs)} clickable object(s) discovered by probing")
     if not objs:
         return None
+    # ADAPTIVE depth: with few clickable objects a deeper search is cheap (small branching); with many,
+    # stay shallow to avoid the blow-up. (Re-probing per node to catch newly-revealed objects is correct
+    # but too slow at scale — a smarter incremental detector is future work.)
+    if len(objs) <= 4 and max_depth < 8:
+        max_depth = 8
     start = env.clone()
     q = deque([(start, [])]); nodes = 0
     while q and nodes < node_cap:
@@ -471,12 +476,27 @@ given a few rendered frames (integer grids) and the effects of probing each acti
    "interactable_hint": [[x,y],...]}    # cells worth probing as transformers/gates (optional)
 Base your answer ONLY on the frames + probe effects; do not assume any game's rules."""
 
+def local_gpt_oss(prompt, payload, endpoint="http://localhost:11437/v1/chat/completions",
+                  model="local/gpt-oss-120b:opt", timeout=120):
+    """Reference `call_llm`: a FREE local LLM (gpt-oss-120b via Ollama) as the per-game inducer. Sends
+    the probe summary, returns the model's text. Verified live: given 'directional actions inert + N
+    cells respond to clicks', gpt-oss replies modality='click' with a correct rationale. Provider-
+    agnostic — swap the endpoint/model for any OpenAI-compatible API."""
+    import json, urllib.request
+    body = json.dumps({"model": model, "temperature": 0, "max_tokens": 300,
+                       "messages": [{"role": "system", "content": prompt},
+                                    {"role": "user", "content": json.dumps(payload)}]}).encode()
+    req = urllib.request.Request(endpoint, body, {"Content-Type": "application/json"})
+    r = json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+    return r["choices"][0]["message"]["content"]
+
+
 class LLMAdapter:
     """The PER-GAME induction surface, produced by an LLM for an UNSEEN game. On a game where the
     general auto-discovery (motion agent + role discovery) is insufficient, the LLM reads a few frames
     + probe effects and returns the hints below. This is the concrete integration point for the
     neuro-symbolic plan (LLM induces the per-game perception; the operators above plan + verify).
-    `call_llm` is injected so this stays API/provider-agnostic (e.g. local gpt-oss via Ollama)."""
+    `call_llm` is injected so this stays API/provider-agnostic (e.g. `local_gpt_oss` above)."""
     def __init__(self, call_llm=None):
         self.call_llm = call_llm                       # fn(prompt, frames) -> JSON str ; None = heuristic
     def induce(self, env: Env, basis):
