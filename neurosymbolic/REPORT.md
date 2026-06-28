@@ -145,7 +145,34 @@ basis, stations (from a HUD panel), slots, multi-step configuration, a *hidden* 
 multi-slot ordering — purely from the render and win/lose feedback, exactly the "infer the hidden rules
 from consequences" skill ARC-AGI-3 targets.
 
+## Generalization: what transfers to unseen games, and what doesn't (`source_free_core.py`)
+The 7/7 source-free agent is **tuned to `ls20`** — its *perception* hard-codes the palette, the 5px
+lattice, the HUD location, and station/slot/refill semantics — so as-is it would **not** transfer to a
+genuinely different ARC-AGI-3 game. The value is the **methodology**, and we make the split explicit:
+
+- **General operators (transfer; `source_free_core.py`)** assume only an `Env` (reset / step / render /
+  win-lose / score): (1) **learn the action basis by probing** — no key meanings assumed; (2) **find
+  the agent by *motion*** — whatever blob translates under a move action, robust to recolour/reshape;
+  (3) **track it** by motion + colour-continuity; (4) **explore** a deterministic reset+replay graph
+  with blocked frontiers; (5) **infer a *hidden* resource** from its consequence (act-until-failure),
+  the way the invisible `ls20` energy was found; (6) **semantics by interaction** — classify an object
+  by the *persistent* effect of touching it, not its appearance; (7) **oracle search** with sub-goal
+  chaining, verified by win/lose. `python source_free_core.py` drives `ls20` L0 through this abstraction
+  with zero engine internals.
+- **Per-game adapter (must be induced; the `Adapter` surface)** — which blob is the agent (or auto), how
+  to read goal progress, which cells to probe. This small surface is exactly what an **LLM/induction
+  module** supplies for an unseen game (the neuro-symbolic plan: model writes the per-game perception +
+  dynamics as code; the general loop above plans + verifies).
+
+So `ls20` 7/7 is an **existence proof** that *once the per-game abstractions are right, source-free
+symbolic solving is complete*. The open frontier — and the right place for the LLM — is **inducing
+those abstractions on an unseen game**. Next steps: lift remaining ls20 specifics into the core,
+add an LLM-driven adapter, and measure cross-game transfer on other public ARC-AGI-3 games (the metric
+comparable to Symbolica's 36%).
+
 ## Files
+- `source_free_core.py` — **game-agnostic skeleton**: the general operators + the `Env`/`Adapter`
+  contracts; `python source_free_core.py` demos them driving `ls20` through the abstraction.
 - `ls20_solver.py` — model + planner + engine verification; `python ls20_solver.py` → solves 7/7.
 - `llm_induce.py` — local-LLM induction with plan-based APD refine loop.
 - `perception.py` — pixel→symbol structure extractor (camera static; recovers obstacle map/player/slot).
