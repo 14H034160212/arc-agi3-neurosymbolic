@@ -157,6 +157,68 @@ def online_solve_click(g: OnlineGame, max_depth=4, node_cap=400, verbose=True):
     return None
 
 
+def _scene_objects(grid, k=24):
+    """Compact structured scene: the largest non-background connected components as
+    (color, cx, cy, size) — a representation an LLM can reason over (vs a raw 64x64 int grid)."""
+    bg = int(np.bincount(grid.flatten()).argmax())
+    objs = []
+    for col in [int(c) for c in np.unique(grid) if int(c) != bg]:
+        objs += [(col, cx, cy, sz) for (cx, cy, sz) in _comps(grid, col, 1)]
+    objs.sort(key=lambda o: -o[3])
+    return objs[:k]
+
+
+def llm_click_plan(scene, clickables, call_llm, n=6):
+    """Ask a FREE local LLM to propose promising click sequences (orderings of clickable indices),
+    given the scene + clickable objects. LLM proposes -> environment verifies (correctness kept)."""
+    import json
+    prompt = (
+        "You are solving a hidden-goal ARC-AGI-3 puzzle. You click objects to make progress; the goal "
+        "is unknown but clicking the right objects in the right order wins the level. Given the scene "
+        "objects (color,x,y,size) and the CLICKABLE objects (indexed), output ONLY JSON: a list of up "
+        f"to {n} candidate click-sequences to try first, best guess first, each a list of clickable "
+        "indices (length 1-4). Favor clicking distinctive/odd-one-out objects, matching pairs, or all "
+        'clickables in a sensible order. Example: {"sequences": [[0],[1,0],[0,1,2]]}'
+    )
+    payload = {"scene_objects": scene[:24],
+               "clickable_objects": [{"i": i, "x": x, "y": y} for i, (x, y) in enumerate(clickables)]}
+    try:
+        txt = call_llm(prompt, payload)
+        seqs = json.loads(txt[txt.index("{"):txt.rindex("}") + 1]).get("sequences", [])
+        out = []
+        for s in seqs:
+            cells = [clickables[i] for i in s if isinstance(i, int) and 0 <= i < len(clickables)]
+            if cells:
+                out.append(cells)
+        return out
+    except Exception as e:
+        return []
+
+
+def online_solve_click_llm(g: OnlineGame, call_llm, verbose=True):
+    """LLM-guided online click solve: discover clickables -> describe scene -> LLM proposes click
+    sequences -> verify each by reset()+replay (env-verified). Falls back to blind BFS if LLM misses."""
+    s0 = g.reset().score(); base = g.grid()
+    objs, _ = online_find_clickables(g)
+    if verbose: print(f"    {g.game_id}: {len(objs)} clickable object(s)")
+    if not objs:
+        return None
+    scene = _scene_objects(base)
+    cands = llm_click_plan(scene, objs, call_llm)
+    if verbose: print(f"    LLM proposed {len(cands)} click-sequence(s) to try first")
+    for cand in cands:                                   # verify LLM proposals first (cheap, few)
+        g.reset(); won = False
+        for (x, y) in cand:
+            g.click(x, y)
+            if g.status() == "WIN" or g.score() > s0: won = True; break
+            if g.status() == "LOSE": break
+        if won:
+            if verbose: print(f"    ✅ {g.game_id} WON L{s0} via LLM plan {cand}")
+            return cand
+    if verbose: print(f"    LLM plans didn't win; falling back to blind BFS")
+    return online_solve_click(g, max_depth=4, verbose=verbose)
+
+
 def main():
     try:
         from dotenv import load_dotenv
@@ -165,15 +227,27 @@ def main():
         pass
     key = os.environ.get("ARC_API_KEY", "")
     args = sys.argv[1:]
-    mode = "solve" if args and args[0] == "--solve" else "probe"
+    mode = "llm" if "--llm" in args else "solve" if "--solve" in args else "probe"
     games = [a for a in args if not a.startswith("--")]
+
+    def call_llm(prompt, payload):
+        import json, urllib.request
+        body = json.dumps({"model": "local/gpt-oss-120b:opt", "temperature": 0, "max_tokens": 2000,
+                           "messages": [{"role": "system", "content": prompt},
+                                        {"role": "user", "content": json.dumps(payload)}]}).encode()
+        req = urllib.request.Request("http://localhost:11437/v1/chat/completions", body,
+                                     {"Content-Type": "application/json"})
+        return json.loads(urllib.request.urlopen(req, timeout=120).read())["choices"][0]["message"]["content"]
     arcade = Arcade(arc_api_key=key, operation_mode=OperationMode.ONLINE)
     card = arcade.open_scorecard(tags=[f"sf-{mode}"])
     try:
         for gid in games:
             g = OnlineGame(arcade, gid, card)
             t = time.time()
-            if mode == "solve":
+            if mode == "llm":
+                online_solve_click_llm(g, call_llm)
+                print(f"      ({time.time()-t:.0f}s)")
+            elif mode == "solve":
                 online_solve_click(g, max_depth=4)
                 print(f"      ({time.time()-t:.0f}s)")
             else:
