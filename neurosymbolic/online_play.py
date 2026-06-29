@@ -219,6 +219,83 @@ def online_solve_click_llm(g: OnlineGame, call_llm, verbose=True):
     return online_solve_click(g, max_depth=4, verbose=verbose)
 
 
+PALETTE = {0: (0, 0, 0), 1: (70, 70, 70), 2: (200, 60, 60), 3: (35, 35, 40), 4: (120, 120, 120),
+           5: (210, 80, 80), 6: (250, 120, 40), 7: (250, 220, 60), 8: (70, 90, 230), 9: (60, 190, 230),
+           10: (240, 130, 200), 11: (245, 225, 70), 12: (245, 150, 50), 13: (120, 220, 120),
+           14: (170, 100, 220), 15: (255, 255, 255)}
+
+def render_png_b64(grid, clickables=None, up=16):
+    """Render the integer grid to an upscaled PNG (distinct palette); label clickables 0..N so the
+    VLM can refer to them by index. Returns base64 string."""
+    import io, base64
+    from PIL import Image, ImageDraw
+    H, W = grid.shape
+    img = Image.new("RGB", (W*up, H*up)); px = img.load()
+    for y in range(H):
+        for x in range(W):
+            v = int(grid[y, x]); c = PALETTE.get(v, (v*17 % 256, v*53 % 256, v*97 % 256))
+            for dy in range(up):
+                for dx in range(up):
+                    px[x*up+dx, y*up+dy] = c
+    if clickables:
+        d = ImageDraw.Draw(img)
+        for i, (x, y) in enumerate(clickables):
+            d.text((x*up, y*up), str(i), fill=(255, 255, 0))
+    buf = io.BytesIO(); img.save(buf, "PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+def call_vlm(b64, prompt, model="qwen3-vl:8b", endpoint="http://localhost:11439/api/chat"):
+    """Call a local multimodal model (qwen3-vl) with an image + prompt; return its text."""
+    import json, urllib.request
+    body = json.dumps({"model": model, "stream": False,
+                       "messages": [{"role": "user", "content": prompt, "images": [b64]}]}).encode()
+    req = urllib.request.Request(endpoint, body, {"Content-Type": "application/json"})
+    return json.loads(urllib.request.urlopen(req, timeout=180).read())["message"]["content"]
+
+def vlm_click_plan(grid, clickables, n=6):
+    """Render the frame with numbered clickables, ask the VLM for click-order(s) to solve. Returns a
+    list of candidate click-sequences (each a list of (x,y))."""
+    import json
+    b64 = render_png_b64(grid, clickables)
+    prompt = (f"This is a puzzle game screenshot. The {len(clickables)} CLICKABLE objects are labelled "
+              f"0..{len(clickables)-1} in yellow. Infer the likely goal, then output ONLY JSON: "
+              '{"sequences": [[i,j],...]} = up to ' + str(n) + " candidate click-orders (lists of the "
+              "labelled indices, length 1-4) most likely to solve the level, best first.")
+    try:
+        txt = call_vlm(b64, prompt)
+        seqs = json.loads(txt[txt.index("{"):txt.rindex("}")+1]).get("sequences", [])
+        out = []
+        for s in seqs:
+            cells = [clickables[i] for i in s if isinstance(i, int) and 0 <= i < len(clickables)]
+            if cells:
+                out.append(cells)
+        return out
+    except Exception:
+        return []
+
+def online_solve_click_vlm(g: OnlineGame, verbose=True):
+    """Multimodal-guided online click solve: discover clickables -> render frame -> qwen3-vl picks the
+    click order (it SEES the puzzle) -> env verifies. Falls back to blind BFS."""
+    s0 = g.reset().score(); base = g.grid()
+    objs, _ = online_find_clickables(g)
+    if verbose: print(f"    {g.game_id}: {len(objs)} clickable object(s)")
+    if not objs:
+        return None
+    cands = vlm_click_plan(base, objs)
+    if verbose: print(f"    qwen3-vl proposed {len(cands)} click-order(s)")
+    for cand in cands:
+        g.reset(); won = False
+        for (x, y) in cand:
+            g.click(x, y)
+            if g.status() == "WIN" or g.score() > s0: won = True; break
+            if g.status() == "LOSE": break
+        if won:
+            if verbose: print(f"    ✅ {g.game_id} WON via qwen3-vl plan {cand}")
+            return cand
+    if verbose: print(f"    VLM plans didn't win; blind BFS fallback")
+    return online_solve_click(g, max_depth=4, verbose=verbose)
+
+
 def main():
     try:
         from dotenv import load_dotenv
@@ -227,7 +304,8 @@ def main():
         pass
     key = os.environ.get("ARC_API_KEY", "")
     args = sys.argv[1:]
-    mode = "llm" if "--llm" in args else "solve" if "--solve" in args else "probe"
+    mode = ("vlm" if "--vlm" in args else "llm" if "--llm" in args
+            else "solve" if "--solve" in args else "probe")
     games = [a for a in args if not a.startswith("--")]
 
     def call_llm(prompt, payload):
@@ -244,7 +322,10 @@ def main():
         for gid in games:
             g = OnlineGame(arcade, gid, card)
             t = time.time()
-            if mode == "llm":
+            if mode == "vlm":
+                online_solve_click_vlm(g)
+                print(f"      ({time.time()-t:.0f}s)")
+            elif mode == "llm":
                 online_solve_click_llm(g, call_llm)
                 print(f"      ({time.time()-t:.0f}s)")
             elif mode == "solve":
