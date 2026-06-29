@@ -103,6 +103,60 @@ def probe_modality(g: OnlineGame, click_samples=14):
     return "unknown", moves, resp
 
 
+def online_find_clickables(g: OnlineGame, max_probes=90, min_change=6):
+    """Discover clickable objects on a real game using reset()+click() only (no clone). A click on an
+    empty cell only renders the 1-px CURSOR; a real interactable changes many pixels — so we require a
+    SUBSTANTIAL change (>= min_change) or a status/score change. Sample foreground cells (strided to
+    cap API calls), keep substantial responders, cluster into objects. Returns (objects, base_grid)."""
+    g.reset(); g0 = g.grid(); H, W = g0.shape
+    bg = int(np.bincount(g0.flatten()).argmax())
+    ys, xs = np.where(g0 != bg); fg = list(zip(xs.tolist(), ys.tolist()))
+    step = max(1, len(fg)//max_probes)
+    objs = []
+    for (x, y) in fg[::step]:
+        if not (0 <= x < W and 0 <= y < H):
+            continue
+        g.reset(); g.click(x, y); gg = g.grid()
+        substantial = gg.shape != g0.shape or int((g0 != gg).sum()) >= min_change
+        if not (substantial or g.status() != "PLAYING" or g.score() > 0):
+            continue
+        if not any(abs(o[0]-x) + abs(o[1]-y) <= 3 for o in objs):
+            objs.append((x, y))
+    return objs, g0
+
+
+def online_solve_click(g: OnlineGame, max_depth=4, node_cap=400, verbose=True):
+    """Solve a click level by RESET+replay candidate search (no clone): BFS over click-target
+    sequences, each evaluated by reset()+replay+win-check. Returns the winning click list or None."""
+    from collections import deque
+    s0 = g.reset().score()
+    objs, _ = online_find_clickables(g)
+    if verbose:
+        print(f"    {g.game_id}: {len(objs)} clickable object(s) found")
+    if not objs:
+        return None
+    q = deque([[]]); nodes = 0
+    while q and nodes < node_cap:
+        seq = q.popleft()
+        for (x, y) in objs:
+            cand = seq + [(x, y)]; nodes += 1
+            g.reset()
+            won = False
+            for (cx, cy) in cand:
+                g.click(cx, cy)
+                if g.status() == "WIN" or g.score() > s0:
+                    won = True; break
+                if g.status() == "LOSE":
+                    break
+            if won:
+                if verbose: print(f"    ✅ {g.game_id} WON L{s0} in {len(cand)} clicks ({nodes} candidates)")
+                return cand
+            if g.status() == "PLAYING" and len(cand) < max_depth:
+                q.append(cand)
+    if verbose: print(f"    {g.game_id}: no win within depth {max_depth} ({nodes} candidates)")
+    return None
+
+
 def main():
     try:
         from dotenv import load_dotenv
@@ -110,17 +164,27 @@ def main():
     except Exception:
         pass
     key = os.environ.get("ARC_API_KEY", "")
-    games = sys.argv[1:] or []
+    args = sys.argv[1:]
+    mode = "solve" if args and args[0] == "--solve" else "probe"
+    games = [a for a in args if not a.startswith("--")]
     arcade = Arcade(arc_api_key=key, operation_mode=OperationMode.ONLINE)
-    card = arcade.open_scorecard(tags=["sf-modality-probe"])
+    card = arcade.open_scorecard(tags=[f"sf-{mode}"])
     try:
         for gid in games:
             g = OnlineGame(arcade, gid, card)
             t = time.time()
-            mod, mv, ck = probe_modality(g)
-            print(f"{gid:18s} modality={mod:8s} (move-dirs={mv}, click-responders={ck})  {time.time()-t:.0f}s")
+            if mode == "solve":
+                online_solve_click(g, max_depth=4)
+                print(f"      ({time.time()-t:.0f}s)")
+            else:
+                mod, mv, ck = probe_modality(g)
+                print(f"{gid:18s} modality={mod:8s} (move-dirs={mv}, click-responders={ck})  {time.time()-t:.0f}s")
     finally:
-        arcade.close_scorecard(card)
+        sc = arcade.close_scorecard(card)
+        try:
+            print("SCORECARD:", sc.model_dump() if hasattr(sc, "model_dump") else sc)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
