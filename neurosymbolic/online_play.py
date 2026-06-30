@@ -244,9 +244,12 @@ def render_png_b64(grid, clickables=None, up=16):
     buf = io.BytesIO(); img.save(buf, "PNG")
     return base64.b64encode(buf.getvalue()).decode()
 
-def call_vlm(b64, prompt, model="qwen3-vl:8b", endpoint="http://localhost:11439/api/chat"):
-    """Call a local multimodal model (qwen3-vl) with an image + prompt; return its text."""
+def call_vlm(b64, prompt, model=None, endpoint=None):
+    """Call a local multimodal model (qwen3-vl) with an image + prompt; return its text.
+    Model/endpoint overridable via VLM_MODEL / VLM_ENDPOINT env vars (to swap in a stronger VLM)."""
     import json, urllib.request
+    model = model or os.environ.get("VLM_MODEL", "qwen3-vl:8b")
+    endpoint = endpoint or os.environ.get("VLM_ENDPOINT", "http://localhost:11439/api/chat")
     body = json.dumps({"model": model, "stream": False,
                        "messages": [{"role": "user", "content": prompt, "images": [b64]}]}).encode()
     req = urllib.request.Request(endpoint, body, {"Content-Type": "application/json"})
@@ -296,6 +299,56 @@ def online_solve_click_vlm(g: OnlineGame, verbose=True):
     return online_solve_click(g, max_depth=4, verbose=verbose)
 
 
+def vlm_next_click(grid, clickables, tried, call_vlm):
+    """One closed-loop step: show the CURRENT frame (numbered clickables), tell the VLM what was just
+    clicked, ask for the single best NEXT click index toward winning. Returns an index or None."""
+    import json
+    b64 = render_png_b64(grid, clickables)
+    hist = ", ".join(str(i) for i in tried[-6:]) or "none yet"
+    prompt = (f"Puzzle game, hidden goal — you win by clicking the right objects in order. The "
+              f"{len(clickables)} clickable objects are labelled 0..{len(clickables)-1} (yellow). You "
+              f"have already clicked: [{hist}]. Look at the CURRENT state and pick the SINGLE next "
+              f'object to click to make progress toward winning. Output ONLY JSON: {{"click": <index>, '
+              f'"reason": "<short>"}}.')
+    try:
+        txt = call_vlm(b64, prompt)
+        obj = json.loads(txt[txt.index("{"):txt.rindex("}")+1])
+        i = int(obj.get("click"))
+        return i if 0 <= i < len(clickables) else None
+    except Exception:
+        return None
+
+
+def online_solve_click_loop(g: OnlineGame, call_vlm, max_steps=14, verbose=True):
+    """Closed-loop multimodal solve (the hypothesis-test loop): at each step the VLM SEES the current
+    frame and picks the next click; we apply it, re-observe, and repeat — verified by win/score.
+    More robust than one-shot for puzzles needing several visually-guided clicks."""
+    s0 = g.reset().score()
+    objs, _ = online_find_clickables(g)
+    if verbose: print(f"    {g.game_id}: {len(objs)} clickable object(s); closed-loop (max {max_steps})")
+    if not objs:
+        return None
+    tried = []; last = None; stuck = 0
+    for step in range(max_steps):
+        grid = g.grid()
+        i = vlm_next_click(grid, objs, tried, call_vlm)
+        if i is None:
+            i = (max(tried[-1], -1) + 1) % len(objs) if tried else 0   # fallback: cycle objects
+        before = grid
+        g.click(*objs[i]); tried.append(i)
+        if g.status() == "WIN" or g.score() > s0:
+            if verbose: print(f"    ✅ {g.game_id} WON in {len(tried)} closed-loop clicks: {tried}")
+            return tried
+        if g.status() == "LOSE":
+            if verbose: print(f"    {g.game_id} LOSE at step {step}")
+            return None
+        stuck = stuck + 1 if np.array_equal(before, g.grid()) else 0
+        if stuck >= 3:                                  # frame frozen -> bail
+            break
+    if verbose: print(f"    {g.game_id}: closed-loop no win in {max_steps} steps (tried {tried})")
+    return None
+
+
 def main():
     try:
         from dotenv import load_dotenv
@@ -304,7 +357,7 @@ def main():
         pass
     key = os.environ.get("ARC_API_KEY", "")
     args = sys.argv[1:]
-    mode = ("vlm" if "--vlm" in args else "llm" if "--llm" in args
+    mode = ("loop" if "--loop" in args else "vlm" if "--vlm" in args else "llm" if "--llm" in args
             else "solve" if "--solve" in args else "probe")
     games = [a for a in args if not a.startswith("--")]
 
@@ -322,7 +375,11 @@ def main():
         for gid in games:
             g = OnlineGame(arcade, gid, card)
             t = time.time()
-            if mode == "vlm":
+            if mode == "loop":
+                vlm_call = lambda b, p: call_vlm(b, p)
+                online_solve_click_loop(g, vlm_call)
+                print(f"      ({time.time()-t:.0f}s)")
+            elif mode == "vlm":
                 online_solve_click_vlm(g)
                 print(f"      ({time.time()-t:.0f}s)")
             elif mode == "llm":
