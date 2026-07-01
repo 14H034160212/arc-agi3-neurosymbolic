@@ -72,6 +72,35 @@ class OnlineGame:
         return self._last.available_actions or []
 
 
+def extract_json(text):
+    """Robustly pull a JSON object out of an LLM/VLM response. `text[text.index('{'):rindex('}')+1]`
+    (used at several call sites) breaks whenever reasoning prose BEFORE the real JSON contains any
+    stray brace (e.g. 'the shape looks like a {square}... {"click":[3,4]}' grabs the wrong span) --
+    scan for BALANCED top-level {...} spans instead and try each with json.loads until one parses,
+    preferring a fenced ```json ... ``` block if present. Returns None (not {}) on total failure so
+    callers can tell 'nothing usable' apart from 'here is an empty object'."""
+    import json, re
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+    depth = 0; start = None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0: start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    return json.loads(text[start:i + 1])
+                except Exception:
+                    start = None                # this span wasn't valid JSON -- keep scanning
+    return None
+
+
 def _comps(grid, color, min_size=3):
     from collections import deque
     H, W = grid.shape; seen = np.zeros_like(grid, bool); out = []
@@ -214,7 +243,12 @@ def llm_click_plan(scene, clickables, call_llm, n=6):
                "clickable_objects": [{"i": i, "x": x, "y": y} for i, (x, y) in enumerate(clickables)]}
     try:
         txt = call_llm(prompt, payload)
-        seqs = json.loads(txt[txt.index("{"):txt.rindex("}") + 1]).get("sequences", [])
+    except Exception as e:
+        print(f"    llm_click_plan: model call FAILED ({type(e).__name__}: {e}) -- not 'no ideas'")
+        return []
+    try:
+        obj = extract_json(txt)
+        seqs = obj.get("sequences", []) if obj else []
         out = []
         for s in seqs:
             cells = [clickables[i] for i in s if isinstance(i, int) and 0 <= i < len(clickables)]
@@ -296,7 +330,12 @@ def vlm_click_plan(grid, clickables, n=6):
               "labelled indices, length 1-4) most likely to solve the level, best first.")
     try:
         txt = call_vlm(b64, prompt)
-        seqs = json.loads(txt[txt.index("{"):txt.rindex("}")+1]).get("sequences", [])
+    except Exception as e:
+        print(f"    vlm_click_plan: model call FAILED ({type(e).__name__}: {e}) -- not 'no ideas'")
+        return []
+    try:
+        obj = extract_json(txt)
+        seqs = obj.get("sequences", []) if obj else []
         out = []
         for s in seqs:
             cells = [clickables[i] for i in s if isinstance(i, int) and 0 <= i < len(clickables)]
@@ -342,9 +381,13 @@ def vlm_next_click(grid, clickables, tried, call_vlm):
               f'"reason": "<short>"}}.')
     try:
         txt = call_vlm(b64, prompt)
-        obj = json.loads(txt[txt.index("{"):txt.rindex("}")+1])
-        i = int(obj.get("click"))
-        return i if 0 <= i < len(clickables) else None
+    except Exception as e:
+        print(f"    vlm_next_click: model call FAILED ({type(e).__name__}: {e}) -- not 'no pick'")
+        return None
+    try:
+        obj = extract_json(txt)
+        i = int(obj.get("click")) if obj else None
+        return i if i is not None and 0 <= i < len(clickables) else None
     except Exception:
         return None
 
@@ -641,23 +684,26 @@ def main():
     }
     try:
         for gid in games:
-            g = OnlineGame(arcade, gid, card)
             t = time.time()
-            if mode == "probe":
+            try:
+                g = OnlineGame(arcade, gid, card)
+                if mode == "probe":
+                    mod, mv, ck = probe_modality(g)
+                    print(f"{gid:18s} modality={mod:8s} (move-dirs={mv}, click-responders={ck})  {time.time()-t:.0f}s")
+                    continue
+                # Route by DETECTED modality instead of blindly click-solving everything: movement and
+                # movement+click games (17/25 = 68% of the public set) previously always scored 0 here
+                # because no solver ever tried a directional action.
                 mod, mv, ck = probe_modality(g)
-                print(f"{gid:18s} modality={mod:8s} (move-dirs={mv}, click-responders={ck})  {time.time()-t:.0f}s")
-                continue
-            # Route by DETECTED modality instead of blindly click-solving everything: movement and
-            # movement+click games (17/25 = 68% of the public set) previously always scored 0 here
-            # because no solver ever tried a directional action.
-            mod, mv, ck = probe_modality(g)
-            print(f"{gid}: modality={mod} (move-dirs={mv}, click-responders={ck})")
-            plan = None
-            if mod in ("movement", "movement+click"):
-                plan = online_solve_movement(g)
-            if plan is None and mod in ("click", "movement+click", "unknown"):
-                plan = click_solvers[mode](g)
-            print(f"      {'WON' if plan else 'no win'} ({time.time()-t:.0f}s)")
+                print(f"{gid}: modality={mod} (move-dirs={mv}, click-responders={ck})")
+                plan = None
+                if mod in ("movement", "movement+click"):
+                    plan = online_solve_movement(g)
+                if plan is None and mod in ("click", "movement+click", "unknown"):
+                    plan = click_solvers[mode](g)
+                print(f"      {'WON' if plan else 'no win'} ({time.time()-t:.0f}s)")
+            except Exception as e:
+                print(f"{gid}: FAILED ({type(e).__name__}: {e}) -- skipping to the next game ({time.time()-t:.0f}s)")
     finally:
         sc = arcade.close_scorecard(card)
         try:

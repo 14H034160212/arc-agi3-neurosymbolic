@@ -19,16 +19,43 @@ op = importlib.util.module_from_spec(spec); spec.loader.exec_module(op)
 FRAME_PNG = Path(__file__).resolve().parent / "_hframe.png"
 
 def call_claude(png_path, prompt, timeout=180):
-    """Invoke Claude (multimodal) headless on an image; return its text."""
+    """Invoke Claude (multimodal) headless on an image; return its text. Raises on a CLI failure
+    instead of silently returning '' -- an auth/permission/crash failure must not be indistinguishable
+    from 'the model proposed nothing' (the caller's own except-blocks already handle degrading from a
+    genuine call failure; masking that here would just hide it one layer earlier)."""
     r = subprocess.run(
         ["claude", "-p", f"Read the image {png_path}. {prompt}", "--allowedTools", "Read"],
         capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError(f"`claude -p` exited {r.returncode}: {r.stderr.strip()[:300]}")
     return r.stdout.strip()
+
+def call_openai_vision(png_path, prompt, timeout=180):
+    """Teacher = a strong multimodal OpenAI model (gpt-5.5). Sends the frame as an inline image."""
+    import urllib.request
+    key = os.environ.get("OPENAI_SECRET_KEY")
+    if not key:
+        raise RuntimeError("OPENAI_SECRET_KEY is not set (needed for the default OpenAI teacher backend; "
+                           "set TEACHER_BACKEND=claude to use the Claude CLI backend instead)")
+    model = os.environ.get("TEACHER_MODEL", "gpt-5.5")
+    b64 = base64.b64encode(Path(png_path).read_bytes()).decode()
+    body = json.dumps({"model": model, "max_completion_tokens": 3000, "messages": [
+        {"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}]}]}).encode()
+    req = urllib.request.Request("https://api.openai.com/v1/chat/completions", body,
+                                 {"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+    return json.loads(urllib.request.urlopen(req, timeout=timeout).read())["choices"][0]["message"]["content"]
+
+def call_model(png_path, prompt):
+    """Teacher dispatcher: OpenAI gpt-5.5 (default) or Claude CLI (TEACHER_BACKEND=claude)."""
+    return call_claude(png_path, prompt) if os.environ.get("TEACHER_BACKEND") == "claude" \
+        else call_openai_vision(png_path, prompt)
 
 def parse_click(txt, W, H):
     try:
-        obj = json.loads(txt[txt.index("{"):txt.rindex("}")+1])
-        c = obj.get("click")
+        obj = op.extract_json(txt)
+        c = obj.get("click") if obj else None
         if isinstance(c, list) and len(c) == 2:
             x, y = int(c[0]), int(c[1])
             if 0 <= x < W and 0 <= y < H:
@@ -49,7 +76,11 @@ def solve_closed(g, max_steps=8, verbose=True):
                   f"Pick the SINGLE next cell to CLICK to make progress. Reply ONLY JSON: "
                   f'{{"click":[x,y],"reason":"<short>"}} with 0<=x<{W}, 0<=y<{H}.')
         t = time.time()
-        txt = call_claude(FRAME_PNG, prompt)
+        try:
+            txt = call_model(FRAME_PNG, prompt)
+        except Exception as e:
+            if verbose: print(f"    step {step}: model call FAILED ({type(e).__name__}: {e}) -- stopping this game, not a real 'no click'")
+            break
         click, reason = parse_click(txt, W, H)
         if verbose:
             print(f"    step {step}: claude -> {click} ({reason[:60]}) [{time.time()-t:.0f}s]")
@@ -81,11 +112,15 @@ def solve_hybrid(g, max_depth=4, verbose=True):
               f"yellow. Infer the goal, then output ONLY JSON: {{\"key_objects\":[indices that matter "
               f"most],\"sequences\":[[i,j,...],...]}} — key_objects (<=5) and up to 6 candidate click "
               f"orders (repeats ALLOWED, length 1-5), best first.")
-    txt = call_claude(FRAME_PNG, prompt)
     try:
-        obj = json.loads(txt[txt.index("{"):txt.rindex("}")+1])
-        key = [i for i in obj.get("key_objects", []) if isinstance(i, int) and 0 <= i < len(objs)]
-        seqs = [[objs[i] for i in s if isinstance(i, int) and 0 <= i < len(objs)] for s in obj.get("sequences", [])]
+        txt = call_model(FRAME_PNG, prompt)
+    except Exception as e:
+        if verbose: print(f"    model call FAILED ({type(e).__name__}: {e}) -- falling back to a blind key-object guess, not a real 'no ideas'")
+        txt = ""
+    try:
+        obj = op.extract_json(txt)
+        key = [i for i in (obj.get("key_objects", []) if obj else []) if isinstance(i, int) and 0 <= i < len(objs)]
+        seqs = [[objs[i] for i in s if isinstance(i, int) and 0 <= i < len(objs)] for s in (obj.get("sequences", []) if obj else [])]
     except Exception:
         key, seqs = list(range(min(4, len(objs)))), []
     if verbose: print(f"    claude key_objects={key}, {len(seqs)} candidate sequence(s)")
@@ -129,10 +164,13 @@ def main():
     try:
         hybrid = os.environ.get("HYBRID", "") == "1"
         for gid in sys.argv[1:]:
-            g = op.OnlineGame(arcade, gid, card)
             print(f"{gid}:")
-            if hybrid: solve_hybrid(g)
-            else: solve_closed(g, max_steps=int(os.environ.get("MAX_STEPS", "8")))
+            try:
+                g = op.OnlineGame(arcade, gid, card)
+                if hybrid: solve_hybrid(g)
+                else: solve_closed(g, max_steps=int(os.environ.get("MAX_STEPS", "8")))
+            except Exception as e:
+                print(f"    {gid}: FAILED ({type(e).__name__}: {e}) -- skipping to the next game")
     finally:
         sc = arcade.close_scorecard(card)
         try: print("SCORECARD levels:", sc.model_dump().get("total_levels_completed"))
