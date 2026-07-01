@@ -404,13 +404,16 @@ def detect_modality(env: Env, sample_clicks=12):
 # Same loop (probe -> discover -> search -> verify) as the movement modality, but the "action" is a
 # spatial CLICK on a grid cell instead of a directional move. This is what ft09/vc33 need.
 
-def _probe_clicks(env: Env, fg, scale):
-    """Click every foreground cell at the given display:grid scale; return the responder cells."""
+def _probe_clicks(env: Env, fg, scale, min_change=6):
+    """Click every foreground cell at the given display:grid scale; return the responder cells.
+    A click on an empty cell typically still renders a cursor artifact (a few pixels) -- require a
+    SUBSTANTIAL change (>= min_change) or a status/score change, else every game misreports as click."""
     base_score = env.score()
     resp = []
     for (x, y) in fg:
-        e = env.clone(); b = e.render(); e.click(int(x) * scale, int(y) * scale)
-        if not np.array_equal(b, e.render()) or e.status() != "PLAYING" or e.score() > base_score:
+        e = env.clone(); b = e.render(); e.click(int(x) * scale, int(y) * scale); a = e.render()
+        substantial = a.shape != b.shape or int((b != a).sum()) >= min_change
+        if substantial or e.status() != "PLAYING" or e.score() > base_score:
             resp.append((int(x), int(y)))
     return resp
 

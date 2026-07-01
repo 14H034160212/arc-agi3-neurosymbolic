@@ -10,28 +10,55 @@ real games and check it against the official modality tags — i.e. does our age
 *unseen* real games. Set ARC_API_KEY env var (or pass --key).
 """
 from __future__ import annotations
+import importlib.util as _ilu
 import os, sys, time
+from pathlib import Path
 import numpy as np
 from arc_agi import Arcade, OperationMode
 from arcengine import GameAction
+
+# Reuse the validated AgentTracker (move-vs-blocked classification by tracked position, not raw
+# frame-equality -- raw equality misclassifies wall-hits whenever an unrelated animation/decoration
+# also changes the frame) from the offline general-operator module instead of reimplementing it.
+_sfc_spec = _ilu.spec_from_file_location("source_free_core", Path(__file__).resolve().parent / "source_free_core.py")
+_sfc = _ilu.module_from_spec(_sfc_spec); _sfc_spec.loader.exec_module(_sfc)
+AgentTracker = _sfc.AgentTracker
 
 DIRS = ["ACTION1", "ACTION2", "ACTION3", "ACTION4"]
 
 
 class OnlineGame:
-    """Thin wrapper over one real game session (reset/step/click/render/status/score)."""
+    """Thin wrapper over one real game session (reset/step/click/render/status/score).
+
+    The remote SDK (arc_agi's RemoteEnvironmentWrapper) returns None -- it never raises -- on ANY
+    transient network/HTTP/parse failure, for reset() AND step(). A stale/None self._last would crash
+    every grid()/status()/score() call downstream, so every mutator here retries a few times on None
+    and only ever assigns self._last from a non-None response."""
     def __init__(self, arcade, game_id, card):
         self.env = arcade.make(game_id, scorecard_id=card); self.game_id = game_id
+        if self.env is None:
+            raise RuntimeError(f"arcade.make({game_id!r}) returned None (bad API key, or metadata "
+                               f"fetch failed) -- cannot play this game")
         self._last = None
-    def reset(self):
-        self._last = self.env.reset(); return self
-    def step(self, name):
-        r = self.env.step(getattr(GameAction, name))
-        if r is not None: self._last = r
+        self.reset()                                     # establish an initial frame up front
+    def reset(self, retries=3):
+        for _ in range(retries):
+            r = self.env.reset()
+            if r is not None:
+                self._last = r; return self
+        if self._last is None:
+            raise RuntimeError(f"{self.game_id}: reset() returned None {retries}x in a row "
+                               f"(network/API failure) and there is no prior frame to fall back to")
+        return self                                       # keep the last-good frame; caller can retry
+    def step(self, name, retries=2):
+        for _ in range(retries):
+            r = self.env.step(getattr(GameAction, name))
+            if r is not None: self._last = r; break
         return self
-    def click(self, x, y):
-        r = self.env.step(GameAction.ACTION6, data={"x": int(x), "y": int(y)})
-        if r is not None: self._last = r
+    def click(self, x, y, retries=2):
+        for _ in range(retries):
+            r = self.env.step(GameAction.ACTION6, data={"x": int(x), "y": int(y)})
+            if r is not None: self._last = r; break
         return self
     def grid(self):
         fr = np.array(self._last.frame)
@@ -64,10 +91,12 @@ def _comps(grid, color, min_size=3):
     return out
 
 
-def probe_modality(g: OnlineGame, click_samples=14):
+def probe_modality(g: OnlineGame, click_samples=14, min_change=6):
     """Source-free modality detection on a real game, using only reset()+step() (no clone):
     movement if >=2 directional actions translate a blob; else click if clicking a foreground cell
-    changes the frame; else unknown. Returns (modality, n_move_dirs, n_click_responders)."""
+    changes the frame SUBSTANTIALLY; else unknown. Returns (modality, n_move_dirs, n_click_responders).
+    A click on an empty cell only renders a 1px cursor -- min_change filters that artifact out (the
+    same threshold online_find_clickables uses), so pure-movement games aren't misclassified as click."""
     g.reset(); g0 = g.grid()
     pal = [int(c) for c in np.unique(g0)]
     bg = int(np.bincount(g0.flatten()).argmax())
@@ -91,8 +120,9 @@ def probe_modality(g: OnlineGame, click_samples=14):
     for (x, y) in fg[:: max(1, len(fg)//click_samples)][:click_samples]:
         if not (0 <= x < W and 0 <= y < H):
             continue
-        g.reset(); g.click(x, y)
-        if g.grid().shape != g0.shape or not np.array_equal(g0, g.grid()) or g.status() != "PLAYING":
+        g.reset(); g.click(x, y); gg = g.grid()
+        substantial = gg.shape != g0.shape or int((g0 != gg).sum()) >= min_change
+        if substantial or g.status() != "PLAYING" or g.score() > 0:
             resp += 1
     if moves >= 2 and resp:
         return "movement+click", moves, resp
@@ -349,6 +379,238 @@ def online_solve_click_loop(g: OnlineGame, call_vlm, max_steps=14, verbose=True)
     return None
 
 
+# ───────────────────────────── MOVEMENT solver (online, no clone) ──────────────────────────────────
+# Code review finding: main()'s dispatch previously NEVER tried directional actions when solving --
+# probe_modality() detected movement correctly, but no online_solve_movement existed and nothing ever
+# called it, so movement / movement+click games (17/25 = 68% of the public set) structurally scored 0
+# regardless of model/search quality. This section fixes that: the same reset()+replay approach as the
+# click solvers, adapted from source_free_core.py's clone()-based operators to the no-clone online API.
+
+def _dominant_translation(g0, g1, palette, min_size=8):
+    """The translation (dx,dy) by which a same-colour blob moved -- picks the SMALLEST-magnitude match
+    across all colour/component pairs, not the first one found (the first-match approach is fragile:
+    it can consistently latch onto a same-sized decorative blob instead of the real single-step move).
+    min_size=8 (raised from the offline default of 3): verified against ls20 that several small STATIC
+    decorative icons (e.g. a row of same-size 'lives' pips, size ~4, a few px apart) get falsely cross-
+    matched to EACH OTHER as a small 'translation' even though neither actually moved -- confirmed by
+    direct inspection (repeated reset() is exactly deterministic; the false match is a same-color/same-
+    size ambiguity, not state drift). Real player/carried blobs observed at size >=10, so min_size=8
+    filters the false positives while keeping true matches."""
+    best = None
+    for col in palette:
+        c0 = _comps(g0, col, min_size); c1 = _comps(g1, col, min_size)
+        for (x0, y0, s0) in c0:
+            for (x1, y1, s1) in c1:
+                if abs(s1 - s0) <= 2:
+                    d = (x1 - x0, y1 - y0)
+                    if d != (0, 0) and (best is None or abs(d[0]) + abs(d[1]) < abs(best[0]) + abs(best[1])):
+                        best = d
+    return best
+
+def online_learn_action_basis(g: OnlineGame, dirs=DIRS):
+    """Learn ACTION->(dx,dy) for directional actions via reset()+step() (no clone). Fills a single
+    unresolved direction by elimination (the 4 directions are a bijection onto the cardinals)."""
+    g.reset(); g0 = g.grid()
+    bg = int(np.bincount(g0.flatten()).argmax())
+    pal = [int(c) for c in np.unique(g0) if int(c) != bg]
+    basis = {}
+    for a in dirs:
+        g.reset(); g.step(a); g1 = g.grid()
+        vec = None
+        if g1.shape == g0.shape and not np.array_equal(g0, g1):
+            vec = _dominant_translation(g0, g1, pal)
+        basis[a] = vec
+    CARD = {(0, -5), (0, 5), (-5, 0), (5, 0)}
+    known = {v for v in basis.values() if v}
+    unknown_acts = [a for a in dirs if basis[a] is None]
+    missing = CARD - known
+    if len(unknown_acts) == 1 and len(missing) == 1:
+        basis[unknown_acts[0]] = missing.pop()
+    return {a: v for a, v in basis.items() if v}
+
+def online_find_agent_start(g: OnlineGame, basis, min_size=8):
+    """Find the agent's start (pixel_pos, colour) via reset()+step() (no clone): the blob that
+    translates by a KNOWN move vector -- identity by motion, not colour. Mirrors source_free_core's
+    find_agent, adapted off env.clone() since the online API doesn't support it."""
+    g.reset(); g0 = g.grid()
+    bg = int(np.bincount(g0.flatten()).argmax())
+    pal = [int(c) for c in np.unique(g0) if int(c) != bg]
+    for a, vec in basis.items():
+        g.reset(); g.step(a); g1 = g.grid()
+        for col in pal:
+            c0 = _comps(g0, col, min_size); c1 = _comps(g1, col, min_size)
+            for (x0, y0, _) in c0:
+                for (x1, y1, _) in c1:
+                    if (x1 - x0, y1 - y0) == vec:
+                        return (x0, y0), col
+    return None
+
+def online_explore_movement(g: OnlineGame, basis, cap=120, min_size=8):
+    """Explore the reachable grid via reset()+replay (no clone): dead-reckoned BFS over positions,
+    move-vs-blocked classified by TRACKED PLAYER POSITION (AgentTracker), not raw frame-equality --
+    raw equality misclassifies a real wall-hit as 'moved' whenever an unrelated pixel (e.g. a HUD/
+    animation tick) also differs, and can under-count real walls. Checks win/score after every
+    replayed action (so a game winnable by pure movement is caught immediately). Returns a dict with
+    start/paths/edges/blocked/won_path."""
+    s0 = g.reset().score()
+    agent = online_find_agent_start(g, basis, min_size)
+    if agent is None:
+        return dict(start=(0, 0), paths={(0, 0): []}, edges={}, blocked=[], won_path=None)
+    p0, col0 = agent
+    pal = [int(c) for c in np.unique(g.grid())]
+    tracker = AgentTracker({a: ("move", v) for a, v in basis.items()}, pal, min_size=min_size)
+
+    start = (0, 0)
+    # cell -> (dead-reckoned pos, tracked pixel pos, tracked colour)
+    paths = {start: []}; pix = {start: (p0, col0)}; edges = {}; order = [start]; i = 0
+    blocked = []; won_path = None
+    while i < len(order) and len(order) < cap and won_path is None:
+        cell = order[i]; i += 1
+        edges[cell] = {}
+        for a, v in basis.items():
+            path = paths[cell]
+            g.reset(); ok = True
+            for step_a in path:
+                g.step(step_a)
+                if g.status() != "PLAYING":
+                    ok = False; break
+            if not ok:
+                continue
+            pc, col = pix[cell]
+            g.step(a)
+            if g.status() == "WIN" or g.score() > s0:
+                won_path = path + [a]; break
+            if g.status() == "LOSE":
+                continue
+            mv = tracker.step_result(g.grid(), pc, col, a)
+            if mv is None:
+                blocked.append((cell, a))            # tracked position didn't advance -> wall / gated
+                continue
+            npos = (cell[0] + v[0], cell[1] + v[1])
+            edges[cell][a] = npos
+            if npos not in paths:
+                paths[npos] = path + [a]; pix[npos] = mv; order.append(npos)
+    return dict(start=start, paths=paths, edges=edges, blocked=blocked, won_path=won_path, pix=pix)
+
+def online_discover_transformers(g: OnlineGame, basis, graph, cap=30, min_diff=6):
+    """Detect cells whose touch-then-return PERSISTENTLY changes carried/world state (station-like).
+    Compares state_signature (pixels FAR from the tracked agent position) before vs after an out-and-
+    back, not the raw full frame -- a raw full-frame compare is confounded by the agent's own sprite
+    changing appearance with facing/last-move-direction (a cosmetic effect near the agent). Requires a
+    SUBSTANTIAL signature diff (>= min_diff pixels): verified against ls20 that a trivial round-trip
+    from the very start (nowhere near any real station) already flips a tiny ~4-pixel patch in the HUD
+    corner every time -- likely a per-action cosmetic tick, not a real config change -- so a small-size
+    threshold (consistent with the min_change used for click-detection elsewhere in this file) is
+    needed the same way it was for clicks."""
+    edges, paths, pix = graph["edges"], graph["paths"], graph["pix"]
+    opp = {a: next((b for b, v2 in basis.items() if v2 == (-v[0], -v[1])), None) for a, v in basis.items()}
+    transformers = []; checked = 0
+    for A, nbrs in edges.items():
+        if checked >= cap: break
+        pA, _ = pix[A]
+        for a, X in nbrs.items():
+            back = opp.get(a)
+            if back is None or X == A:
+                continue
+            checked += 1
+            g.reset()
+            for step_a in paths[A]: g.step(step_a)
+            before = _sfc.state_signature(g.grid(), pA)
+            g.step(a); g.step(back)
+            after = _sfc.state_signature(g.grid(), pA)
+            if len(before ^ after) >= min_diff:
+                transformers.append(X)
+    return sorted(set(transformers))
+
+def online_solve_movement(g: OnlineGame, max_cycles=3, cap=120, verbose=True):
+    """Solve a MOVEMENT game online: learn the action basis, explore the reachable grid (win-checked
+    inline), discover transformer cells by persistent effect, then search (transformer x cycle-count x
+    blocked-frontier), verified by win/score. Adapts source_free_core.solve_single_goal's approach to
+    the no-clone online API. Honest scope: no hidden-resource (energy) inference or multi-goal chaining
+    here yet -- this fixes the 'movement is never even attempted' structural gap, it does not claim to
+    replicate the full local ls20 pipeline's depth."""
+    from collections import deque
+    basis = online_learn_action_basis(g)
+    if len(basis) < 2:
+        if verbose: print(f"    {g.game_id}: action basis too weak {basis} -- not a movement game")
+        return None
+    if verbose: print(f"    {g.game_id}: action basis {basis}")
+    graph = online_explore_movement(g, basis, cap=cap)
+    if graph["won_path"]:
+        if verbose: print(f"    ✅ {g.game_id} WON by exploration alone: {graph['won_path']}")
+        return graph["won_path"]
+    if verbose:
+        print(f"    {g.game_id}: explored {len(graph['paths'])} cells, "
+              f"{len(graph['blocked'])} blocked frontiers")
+    if not graph["blocked"]:
+        if verbose: print(f"    {g.game_id}: no blocked frontier to target, no win during exploration")
+        return None
+    transformers = online_discover_transformers(g, basis, graph)
+    if verbose: print(f"    {g.game_id}: {len(transformers)} transformer cell(s): {transformers}")
+
+    edges, paths, start = graph["edges"], graph["paths"], graph["start"]
+    def bfs_path(src, dst):
+        if src == dst: return []
+        seen = {src}; q = deque([(src, [])])
+        while q:
+            c, p = q.popleft()
+            for a, nb in edges.get(c, {}).items():
+                if nb in seen: continue
+                if nb == dst: return p + [a]
+                seen.add(nb); q.append((nb, p + [a]))
+        return None
+    def offback(C):
+        for a, nb in edges.get(C, {}).items():
+            if nb == C: continue
+            back = next((b for b, nb2 in edges.get(nb, {}).items() if nb2 == C), None)
+            if back: return [a, back]
+        return None
+    def cycle_path(C, k):
+        bp = bfs_path(start, C)
+        if bp is None or k <= 1: return bp
+        ob = offback(C)
+        return None if ob is None else bp + ob * (k - 1)
+
+    s0 = g.reset().score()
+    def try_plan(plan):
+        g.reset()
+        for a in plan:
+            g.step(a)
+            if g.status() == "WIN" or g.score() > s0: return True
+            if g.status() == "LOSE": return False
+        return False
+
+    depth = lambda p: abs(p[0]) + abs(p[1])
+    ftgt = lambda fr: (fr[0][0] + basis[fr[1]][0], fr[0][1] + basis[fr[1]][1])
+    frontiers = sorted(graph["blocked"], key=lambda fr: -depth(ftgt(fr)))
+    cands = transformers or sorted(paths.keys(), key=lambda c: -depth(c))[:12]
+
+    # Honest caveat: transformer discovery can false-positive (e.g. a minimap/secondary position
+    # indicator elsewhere on screen can look like a persistent state change even with no real
+    # station touched -- observed on ls20). Bound the search so a bad transformer list can't burn
+    # thousands of network round-trips chasing a false lead; each trial here is a real API replay.
+    trial_cap = 300; t0 = time.time(); time_cap = 90.0
+    trials = 0
+    for (cell, a) in frontiers:
+        for C in cands:
+            for k in range(1, max_cycles + 1):
+                if trials >= trial_cap or time.time() - t0 > time_cap:
+                    if verbose: print(f"    {g.game_id}: search capped ({trials} trials, {time.time()-t0:.0f}s)")
+                    return None
+                cp = cycle_path(C, k)
+                if cp is None: continue
+                seg = bfs_path(C, cell)
+                if seg is None: continue
+                plan = cp + seg + [a]; trials += 1
+                if try_plan(plan):
+                    if verbose:
+                        print(f"    ✅ {g.game_id} WON via transformer {C}x{k} -> frontier "
+                              f"({trials} trials): {plan}")
+                    return plan
+    if verbose: print(f"    {g.game_id}: no winning (transformer x cycle x frontier) combo ({trials} trials)")
+    return None
+
+
 def main():
     try:
         from dotenv import load_dotenv
@@ -371,26 +633,31 @@ def main():
         return json.loads(urllib.request.urlopen(req, timeout=120).read())["choices"][0]["message"]["content"]
     arcade = Arcade(arc_api_key=key, operation_mode=OperationMode.ONLINE)
     card = arcade.open_scorecard(tags=[f"sf-{mode}"])
+    click_solvers = {
+        "loop": lambda g: online_solve_click_loop(g, lambda b, p: call_vlm(b, p)),
+        "vlm": online_solve_click_vlm,
+        "llm": lambda g: online_solve_click_llm(g, call_llm),
+        "solve": lambda g: online_solve_click(g, max_depth=4),
+    }
     try:
         for gid in games:
             g = OnlineGame(arcade, gid, card)
             t = time.time()
-            if mode == "loop":
-                vlm_call = lambda b, p: call_vlm(b, p)
-                online_solve_click_loop(g, vlm_call)
-                print(f"      ({time.time()-t:.0f}s)")
-            elif mode == "vlm":
-                online_solve_click_vlm(g)
-                print(f"      ({time.time()-t:.0f}s)")
-            elif mode == "llm":
-                online_solve_click_llm(g, call_llm)
-                print(f"      ({time.time()-t:.0f}s)")
-            elif mode == "solve":
-                online_solve_click(g, max_depth=4)
-                print(f"      ({time.time()-t:.0f}s)")
-            else:
+            if mode == "probe":
                 mod, mv, ck = probe_modality(g)
                 print(f"{gid:18s} modality={mod:8s} (move-dirs={mv}, click-responders={ck})  {time.time()-t:.0f}s")
+                continue
+            # Route by DETECTED modality instead of blindly click-solving everything: movement and
+            # movement+click games (17/25 = 68% of the public set) previously always scored 0 here
+            # because no solver ever tried a directional action.
+            mod, mv, ck = probe_modality(g)
+            print(f"{gid}: modality={mod} (move-dirs={mv}, click-responders={ck})")
+            plan = None
+            if mod in ("movement", "movement+click"):
+                plan = online_solve_movement(g)
+            if plan is None and mod in ("click", "movement+click", "unknown"):
+                plan = click_solvers[mode](g)
+            print(f"      {'WON' if plan else 'no win'} ({time.time()-t:.0f}s)")
     finally:
         sc = arcade.close_scorecard(card)
         try:
