@@ -429,40 +429,61 @@ def online_solve_click_loop(g: OnlineGame, call_vlm, max_steps=14, verbose=True)
 # regardless of model/search quality. This section fixes that: the same reset()+replay approach as the
 # click solvers, adapted from source_free_core.py's clone()-based operators to the no-clone online API.
 
-def _dominant_translation(g0, g1, palette, min_size=8):
-    """The translation (dx,dy) by which a same-colour blob moved -- picks the SMALLEST-magnitude match
-    across all colour/component pairs, not the first one found (the first-match approach is fragile:
-    it can consistently latch onto a same-sized decorative blob instead of the real single-step move).
+def _translation_candidates(g0, g1, palette, min_size=8):
+    """All (displacement, evidence) matches -- a same-colour before/after component pair whose size
+    is stable (+-2px). Returns [(d, (col, (x0,y0,s0), (x1,y1,s1)))], sorted smallest-magnitude first.
     min_size=8 (raised from the offline default of 3): verified against ls20 that several small STATIC
     decorative icons (e.g. a row of same-size 'lives' pips, size ~4, a few px apart) get falsely cross-
     matched to EACH OTHER as a small 'translation' even though neither actually moved -- confirmed by
-    direct inspection (repeated reset() is exactly deterministic; the false match is a same-color/same-
-    size ambiguity, not state drift). Real player/carried blobs observed at size >=10, so min_size=8
-    filters the false positives while keeping true matches."""
-    best = None
+    direct inspection (repeated reset() is exactly deterministic; the false match is a same-colour/
+    same-size ambiguity, not state drift)."""
+    cands = []
     for col in palette:
         c0 = _comps(g0, col, min_size); c1 = _comps(g1, col, min_size)
         for (x0, y0, s0) in c0:
             for (x1, y1, s1) in c1:
                 if abs(s1 - s0) <= 2:
                     d = (x1 - x0, y1 - y0)
-                    if d != (0, 0) and (best is None or abs(d[0]) + abs(d[1]) < abs(best[0]) + abs(best[1])):
-                        best = d
-    return best
+                    if d != (0, 0):
+                        cands.append((d, (col, (x0, y0, s0), (x1, y1, s1))))
+    cands.sort(key=lambda t: abs(t[0][0]) + abs(t[0][1]))
+    return cands
+
+def _dominant_translation(g0, g1, palette, min_size=8):
+    """The translation (dx,dy) by which a same-colour blob moved -- the smallest-magnitude candidate.
+    See online_learn_action_basis for why the smallest-magnitude candidate isn't always trustworthy on
+    its own (a global per-action UI tick can beat a real, larger player move)."""
+    cands = _translation_candidates(g0, g1, palette, min_size)
+    return cands[0][0] if cands else None
 
 def online_learn_action_basis(g: OnlineGame, dirs=DIRS):
     """Learn ACTION->(dx,dy) for directional actions via reset()+step() (no clone). Fills a single
-    unresolved direction by elimination (the 4 directions are a bijection onto the cardinals)."""
+    unresolved direction by elimination (the 4 directions are a bijection onto the cardinals).
+
+    Cross-action artifact rejection (found on cd82/ft09): a global per-action UI tick -- e.g. a turn
+    counter or energy bar shrinking by a fixed few pixels EVERY action, regardless of direction -- can
+    be a smaller-magnitude 'translation' than the real (larger) player move, so naively taking each
+    action's smallest-magnitude candidate makes ALL FOUR actions degenerately resolve to the SAME
+    vector (confirmed: this exact (color, before-component, after-component) triple recurred
+    byte-for-byte identically across all 4 actions on cd82). A real per-direction move must be
+    DIFFERENT for different actions; any (colour, before, after) triple that recurs IDENTICALLY across
+    2+ different actions is therefore an artifact, not a move -- exclude it and use each action's best
+    REMAINING candidate."""
     g.reset(); g0 = g.grid()
     bg = int(np.bincount(g0.flatten()).argmax())
     pal = [int(c) for c in np.unique(g0) if int(c) != bg]
-    basis = {}
+    per_action = {}
     for a in dirs:
         g.reset(); g.step(a); g1 = g.grid()
-        vec = None
-        if g1.shape == g0.shape and not np.array_equal(g0, g1):
-            vec = _dominant_translation(g0, g1, pal)
-        basis[a] = vec
+        per_action[a] = (_translation_candidates(g0, g1, pal) if g1.shape == g0.shape
+                         and not np.array_equal(g0, g1) else [])
+    from collections import Counter
+    evidence_count = Counter(ev for cands in per_action.values() for _, ev in cands)
+    artifacts = {ev for ev, n in evidence_count.items() if n >= 2}
+    basis = {}
+    for a, cands in per_action.items():
+        clean = [d for d, ev in cands if ev not in artifacts]
+        basis[a] = clean[0] if clean else None
     CARD = {(0, -5), (0, 5), (-5, 0), (5, 0)}
     known = {v for v in basis.values() if v}
     unknown_acts = [a for a in dirs if basis[a] is None]
