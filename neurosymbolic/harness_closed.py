@@ -31,28 +31,55 @@ def call_claude(png_path, prompt, timeout=180):
     return r.stdout.strip()
 
 def call_openai_vision(png_path, prompt, timeout=180):
-    """Teacher = a strong multimodal OpenAI model (gpt-5.5). Sends the frame as an inline image."""
+    """Teacher = a strong multimodal OpenAI model (gpt-5.5). Sends the frame as an inline image.
+
+    reasoning_effort matters a lot here: verified directly against the API that gpt-5.5's DEFAULT
+    reasoning effort burns the ENTIRE token budget on invisible reasoning tokens and returns an EMPTY
+    message (finish_reason='length', reasoning_tokens=8000/8000, content_len=0) even at
+    max_completion_tokens=8000 for this single-click-pick task -- this looked exactly like 'the model
+    has no answer' but is actually 'the model was never allowed to finish reasoning'. Setting
+    reasoning_effort='low' fixed it immediately (finish_reason='stop', real JSON content). Without
+    this, every closed-loop run would silently degrade to 0 real model turns and look like a
+    capability failure when it was a token-budget misconfiguration."""
     import urllib.request
     key = os.environ.get("OPENAI_SECRET_KEY")
     if not key:
         raise RuntimeError("OPENAI_SECRET_KEY is not set (needed for the default OpenAI teacher backend; "
                            "set TEACHER_BACKEND=claude to use the Claude CLI backend instead)")
     model = os.environ.get("TEACHER_MODEL", "gpt-5.5")
+    effort = os.environ.get("TEACHER_REASONING_EFFORT", "low")
     b64 = base64.b64encode(Path(png_path).read_bytes()).decode()
-    body = json.dumps({"model": model, "max_completion_tokens": 3000, "messages": [
-        {"role": "user", "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}]}]}).encode()
+    payload = {"model": model, "max_completion_tokens": 4000,
+              "messages": [{"role": "user", "content": [
+                  {"type": "text", "text": prompt},
+                  {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}]}]}
+    if effort:
+        payload["reasoning_effort"] = effort
+    body = json.dumps(payload).encode()
     req = urllib.request.Request("https://api.openai.com/v1/chat/completions", body,
                                  {"Authorization": "Bearer " + key, "Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=timeout).read())["choices"][0]["message"]["content"]
+    resp = json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+    choice = resp["choices"][0]
+    content = choice["message"]["content"]
+    if not content and choice.get("finish_reason") == "length":
+        usage = resp.get("usage", {})
+        raise RuntimeError(f"gpt vision call returned EMPTY content (finish_reason=length, "
+                           f"reasoning_tokens={usage.get('completion_tokens_details', {}).get('reasoning_tokens')}"
+                           f"/{usage.get('completion_tokens')}) -- the model burned its whole budget on "
+                           f"reasoning and never answered; this is a config issue, not 'no answer'")
+    return content
 
 def call_model(png_path, prompt):
     """Teacher dispatcher: OpenAI gpt-5.5 (default) or Claude CLI (TEACHER_BACKEND=claude)."""
     return call_claude(png_path, prompt) if os.environ.get("TEACHER_BACKEND") == "claude" \
         else call_openai_vision(png_path, prompt)
 
-def parse_click(txt, W, H):
+def parse_click(txt, W, H, upscale=16):
+    """Parse the model's {"click":[x,y]} reply. Despite the prompt stating the expected grid range
+    (0<=x<W), a vision model shown the UPSCALED render (render_png_b64's default up=16) sometimes
+    answers in the PIXEL space it actually sees (e.g. returned [504,168] on a 64x64 grid, which is
+    exactly (504,168)/16 = (31.5,10.5) in grid space) rather than the stated grid coordinates -- so an
+    out-of-range answer is auto-rescaled by the known upscale factor before being rejected."""
     try:
         obj = op.extract_json(txt)
         c = obj.get("click") if obj else None
@@ -60,6 +87,9 @@ def parse_click(txt, W, H):
             x, y = int(c[0]), int(c[1])
             if 0 <= x < W and 0 <= y < H:
                 return (x, y), obj.get("reason", "")
+            xs, ys = round(x / upscale), round(y / upscale)
+            if 0 <= xs < W and 0 <= ys < H:
+                return (xs, ys), obj.get("reason", "") + " [auto-rescaled from pixel space]"
     except Exception:
         pass
     return None, txt[:80]
