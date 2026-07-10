@@ -47,7 +47,7 @@ def call_llm_text(prompt, payload_text, model=None, endpoint=None, timeout=150):
     return json.loads(urllib.request.urlopen(req, timeout=timeout).read())["message"]["content"]
 
 
-def call_llm_vision(b64, prompt, model=None, endpoint=None, timeout=150):
+def call_llm_vision(b64, prompt, model=None, endpoint=None, timeout=280):
     """Multimodal call: the rendered frame (objects numbered 0..N-1, matching the Prolog facts'
     indices) PLUS the text prompt (facts + instructions). Lets the model use VISUAL pattern
     recognition (colour grouping, shape matching, path shape) to inform the Prolog rule it writes --
