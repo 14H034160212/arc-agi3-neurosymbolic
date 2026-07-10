@@ -69,10 +69,25 @@ def call_openai_vision(png_path, prompt, timeout=180):
                            f"reasoning and never answered; this is a config issue, not 'no answer'")
     return content
 
+def call_local_vlm(png_path, prompt, timeout=150):
+    """Open-weight teacher: a local multimodal model via Ollama (default qwen3.6:27b, confirmed
+    vision-capable via /api/show's capabilities list despite lacking a '-vl' suffix). Reuses
+    online_play.py's call_vlm (base64-image + /api/chat), just adapting the png-path/timeout API to
+    match call_claude/call_openai_vision so it's a drop-in alternative in call_model's dispatcher."""
+    b64 = base64.b64encode(Path(png_path).read_bytes()).decode()
+    model = os.environ.get("TEACHER_MODEL", "qwen3.6:27b")
+    endpoint = os.environ.get("TEACHER_ENDPOINT", "http://localhost:11455/api/chat")
+    return op.call_vlm(b64, prompt, model=model, endpoint=endpoint)
+
 def call_model(png_path, prompt):
-    """Teacher dispatcher: OpenAI gpt-5.5 (default) or Claude CLI (TEACHER_BACKEND=claude)."""
-    return call_claude(png_path, prompt) if os.environ.get("TEACHER_BACKEND") == "claude" \
-        else call_openai_vision(png_path, prompt)
+    """Teacher dispatcher: local open-weight VLM (default) / OpenAI gpt-5.5 (TEACHER_BACKEND=openai)
+    / Claude CLI (TEACHER_BACKEND=claude)."""
+    backend = os.environ.get("TEACHER_BACKEND", "local")
+    if backend == "claude":
+        return call_claude(png_path, prompt)
+    if backend == "openai":
+        return call_openai_vision(png_path, prompt)
+    return call_local_vlm(png_path, prompt)
 
 def parse_click(txt, W, H, upscale=16):
     """Parse the model's {"click":[x,y]} reply. Despite the prompt stating the expected grid range
@@ -97,14 +112,39 @@ def parse_click(txt, W, H, upscale=16):
 def solve_closed(g, max_steps=8, verbose=True):
     s0 = g.reset().score()
     hist = []
+    prompt_mode = os.environ.get("CLOSED_PROMPT_MODE", "free").strip().lower()
+    include_history = os.environ.get("CLOSED_INCLUDE_HISTORY", "1") != "0"
+    clickables = None
+    if prompt_mode == "clickable":
+        probe_cap = int(os.environ.get("CLOSED_CLICKABLE_MAX_PROBES", "30"))
+        clickables, _ = op.online_find_clickables(g, max_probes=probe_cap)
     for step in range(max_steps):
         grid = g.grid(); H, W = grid.shape
         b64 = op.render_png_b64(grid)                  # upscaled PNG of the current state
         FRAME_PNG.write_bytes(base64.b64decode(b64))
-        prompt = (f"It is the CURRENT screen of a {W}x{H}-cell puzzle game (upscaled 16x), hidden goal. "
-                  f"You win by clicking the right cells in order. Clicks so far (grid x,y): {hist[-6:]}. "
-                  f"Pick the SINGLE next cell to CLICK to make progress. Reply ONLY JSON: "
-                  f'{{"click":[x,y],"reason":"<short>"}} with 0<=x<{W}, 0<=y<{H}.')
+        hist_txt = str(hist[-6:]) if include_history else "[]"
+        if prompt_mode == "clickable":
+            use_clickables = clickables or []
+            if use_clickables:
+                clickables_txt = ", ".join([f"[{x},{y}]" for (x, y) in use_clickables])
+                prompt = (
+                    f"It is the CURRENT screen of a {W}x{H}-cell puzzle game (upscaled 16x), hidden goal. "
+                    f"You win by clicking the right cells in order. Clicks so far (grid x,y): {hist_txt}. "
+                    f"Allowed clickable cells now (grid x,y): [{clickables_txt}]. "
+                    f"Pick the SINGLE next cell to CLICK, and it MUST be one of the allowed clickable cells. "
+                    f"Reply ONLY JSON: "
+                    f'{{"click":[x,y],"reason":"<short>"}}.'
+                )
+            else:
+                prompt = (f"It is the CURRENT screen of a {W}x{H}-cell puzzle game (upscaled 16x), hidden goal. "
+                          f"You win by clicking the right cells in order. Clicks so far (grid x,y): {hist_txt}. "
+                          f"Pick the SINGLE next cell to CLICK to make progress. Reply ONLY JSON: "
+                          f'{{"click":[x,y],"reason":"<short>"}} with 0<=x<{W}, 0<=y<{H}.')
+        else:
+            prompt = (f"It is the CURRENT screen of a {W}x{H}-cell puzzle game (upscaled 16x), hidden goal. "
+                      f"You win by clicking the right cells in order. Clicks so far (grid x,y): {hist_txt}. "
+                      f"Pick the SINGLE next cell to CLICK to make progress. Reply ONLY JSON: "
+                      f'{{"click":[x,y],"reason":"<short>"}} with 0<=x<{W}, 0<=y<{H}.')
         t = time.time()
         try:
             txt = call_model(FRAME_PNG, prompt)
@@ -113,7 +153,7 @@ def solve_closed(g, max_steps=8, verbose=True):
             break
         click, reason = parse_click(txt, W, H)
         if verbose:
-            print(f"    step {step}: claude -> {click} ({reason[:60]}) [{time.time()-t:.0f}s]")
+            print(f"    step {step}: teacher -> {click} ({reason[:60]}) [{time.time()-t:.0f}s]")
         if click is None:
             break
         g.click(*click); hist.append(list(click))
