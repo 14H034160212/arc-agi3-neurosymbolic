@@ -37,13 +37,27 @@ nearest(Cur, Cands, Best) :-
 """
 
 def call_llm_text(prompt, payload_text, model=None, endpoint=None, timeout=150):
-    """Text-only call to a local Ollama model (no image -- the scene is already given as facts in
-    the prompt, so a vision step isn't required here; keeps this fast and model-agnostic)."""
+    """Text-only call to a local Ollama model (no image)."""
     import json, urllib.request
     model = model or os.environ.get("TEACHER_MODEL", "qwen3-vl:8b")
     endpoint = endpoint or os.environ.get("TEACHER_ENDPOINT", "http://localhost:11439/api/chat")
     body = json.dumps({"model": model, "stream": False,
                        "messages": [{"role": "user", "content": prompt + "\n\n" + payload_text}]}).encode()
+    req = urllib.request.Request(endpoint, body, {"Content-Type": "application/json"})
+    return json.loads(urllib.request.urlopen(req, timeout=timeout).read())["message"]["content"]
+
+
+def call_llm_vision(b64, prompt, model=None, endpoint=None, timeout=150):
+    """Multimodal call: the rendered frame (objects numbered 0..N-1, matching the Prolog facts'
+    indices) PLUS the text prompt (facts + instructions). Lets the model use VISUAL pattern
+    recognition (colour grouping, shape matching, path shape) to inform the Prolog rule it writes --
+    without this, the model only has coordinates and can only hypothesize generic geometric orders
+    (nearest-neighbour, sort-by-axis), which is not enough for puzzles whose real rule is visual."""
+    import json, urllib.request
+    model = model or os.environ.get("TEACHER_MODEL", "qwen3-vl:8b")
+    endpoint = endpoint or os.environ.get("TEACHER_ENDPOINT", "http://localhost:11439/api/chat")
+    body = json.dumps({"model": model, "stream": False,
+                       "messages": [{"role": "user", "content": prompt, "images": [b64]}]}).encode()
     req = urllib.request.Request(endpoint, body, {"Content-Type": "application/json"})
     return json.loads(urllib.request.urlopen(req, timeout=timeout).read())["message"]["content"]
 
@@ -58,10 +72,12 @@ def write_rule_prompt(objects, feedback=None):
     obj_lines = "\n".join(f"object({i}, {x}, {y})." for i, (x, y) in enumerate(objects))
     fb = f"\n\nPREVIOUS ATTEMPT FAILED. Divergence: {feedback}\nRevise the rule to fix this specific issue." if feedback else ""
     return (
-        "You are solving a hidden-goal ARC-AGI-3 click puzzle. You are given the CLICKABLE objects as "
-        "Prolog facts object(Id, X, Y). You do NOT see the image -- you must hypothesize the click "
-        "ORDER RULE from the object layout (e.g. nearest-neighbour path, sorted by position, a "
-        "geometric pattern, symmetry, grouping by proximity).\n\n"
+        "You are solving a hidden-goal ARC-AGI-3 click puzzle. The image shows the puzzle; the "
+        f"{len(objects)} CLICKABLE objects are labelled 0..{len(objects)-1} in yellow, matching the "
+        "Prolog facts below. LOOK AT THE IMAGE FIRST: identify the VISUAL pattern that determines "
+        "click order or grouping -- colour, shape, matching pairs, a path/line the objects trace, "
+        "symmetry, or proximity. Then encode THAT pattern as a Prolog rule (not a generic nearest-"
+        "neighbour tour unless the image actually shows a path).\n\n"
         f"Facts:\n{obj_lines}\n\n"
         "You may use these helper predicates (already defined, do not redefine them):\n"
         f"{PROLOG_STDLIB}\n"
@@ -105,15 +121,16 @@ def solve_prolog(g, max_rounds=3, verbose=True):
     replay against the REAL game -> on failure, localize the first divergence and feed it back for a
     revision, up to max_rounds."""
     s0 = g.reset().score()
-    objs, _ = op.online_find_clickables(g)
+    objs, base_grid = op.online_find_clickables(g)
     if verbose: print(f"    {g.game_id}: {len(objs)} clickable object(s)")
     if not objs:
         return None
+    b64 = op.render_png_b64(base_grid, objs)          # objects numbered 0..N-1, matching Prolog facts
     feedback = None
     for round_i in range(max_rounds):
         prompt = write_rule_prompt(objs, feedback)
         try:
-            txt = call_llm_text("", prompt)
+            txt = call_llm_vision(b64, prompt)
         except Exception as e:
             if verbose: print(f"    round {round_i}: model call FAILED ({type(e).__name__}: {e})")
             break
